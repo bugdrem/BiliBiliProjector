@@ -1,7 +1,8 @@
 package com.bilitv.app;
 
 import android.view.Surface;
-import android.view.TextureView;
+import android.view.SurfaceHolder;
+import android.view.SurfaceView;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.FrameLayout;
@@ -48,7 +49,14 @@ import java.util.Map;
 public class NativePlayerPlugin extends Plugin {
 
     private ExoPlayer player;
-    private TextureView textureView;
+    /**
+     * P9.46（Z7X 闪退对策）：渲染层 TextureView → SurfaceView。
+     * TextureView 走 app 内 GL 合成（老 GPU 驱动上是常见 native 闪退源，且每帧拷贝），
+     * SurfaceView 由系统独立窗口合成、天然位于窗口层之下——正好满足 D55 的
+     * 「视频在底、WebView（透明挖洞）在上」架构，且是老电视/投影上最稳的路径。
+     * Surface 由 SurfaceHolder 系统管理，**不可手动 release**，只做摘挂。
+     */
+    private SurfaceView surfaceView;
     /** P9.44：Surface 单例复用+显式释放（原先每次 load 匿名 new Surface 从不 release，
      *  长时间连播/切清晰度会不断泄漏 BufferQueue，最终硬解 IllegalStateException） */
     private android.view.Surface videoSurface;
@@ -69,7 +77,7 @@ public class NativePlayerPlugin extends Plugin {
 
     /**
      * 原生渲染进行中（P9.29 D45）：MainActivity.dispatchTouchEvent 据此把触摸
-     * 直接派发给 WebView，绕过盖在视频区上方的 TextureView（点击丢失根治）。
+     * 直接派发给 WebView（渲染层不参与焦点，事件由 WebView 处理）。
      * load 置 true；release/hide 置 false。volatile 保证跨线程可见。
      */
     public static volatile boolean rendering = false;
@@ -151,39 +159,33 @@ public class NativePlayerPlugin extends Plugin {
             .build();
     }
 
-    /** TextureView 就绪后把 Surface 交给播放器（P9.44：Surface 单例复用 + 销毁时释放） */
-    private final TextureView.SurfaceTextureListener surfaceListener =
-        new TextureView.SurfaceTextureListener() {
-            @Override
-            public void onSurfaceTextureAvailable(android.graphics.SurfaceTexture surface, int w, int h) {
-                if (videoSurface == null) videoSurface = new Surface(surface);
-                surfaceReady = true;
-                if (player != null) {
-                    player.setVideoSurface(videoSurface);
-                    if (pendingStart) {
-                        pendingStart = false;
-                        player.prepare();
-                        player.setPlayWhenReady(true);
-                    }
+    /** SurfaceHolder 回调：surface 就绪即交给播放器（P9.46 SurfaceView 版） */
+    /** SurfaceView 就绪后把 Surface 交给播放器（Surface 由系统持有，摘挂即可，勿 release） */
+    private final SurfaceHolder.Callback surfaceCallback = new SurfaceHolder.Callback() {
+        @Override
+        public void surfaceCreated(SurfaceHolder holder) {
+            surfaceReady = true;
+            videoSurface = holder.getSurface();
+            if (player != null) {
+                player.setVideoSurface(videoSurface);
+                if (pendingStart) {
+                    pendingStart = false;
+                    player.prepare();
+                    player.setPlayWhenReady(true);
                 }
             }
+        }
 
-            @Override
-            public void onSurfaceTextureSizeChanged(android.graphics.SurfaceTexture surface, int w, int h) {}
+        @Override
+        public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {}
 
-            @Override
-            public boolean onSurfaceTextureDestroyed(android.graphics.SurfaceTexture surface) {
-                // P9.44：TextureView 销毁会带着 SurfaceTexture 一起走，必须先把 Surface 从播放器
-                // 上摘下再 release，否则遗留的 MediaCodec 仍在写废弃队列（典型崩溃：
-                // IllegalStateException "BufferQueue has been abandoned"）
-                android.util.Log.w("BiliTV", "surface DESTROYED");
-                releaseSurface();
-                return true;
-            }
-
-            @Override
-            public void onSurfaceTextureUpdated(android.graphics.SurfaceTexture surface) {}
-        };
+        @Override
+        public void surfaceDestroyed(SurfaceHolder holder) {
+            // Surface 随系统销毁：只需把播放器摘下（不能手动 release，归 SurfaceHolder 管）
+            android.util.Log.w("BiliTV", "surface DESTROYED");
+            releaseSurface();
+        }
+    };
 
     @PluginMethod
     public void load(PluginCall call) {
@@ -212,42 +214,35 @@ public class NativePlayerPlugin extends Plugin {
             if (!headerMap.isEmpty()) httpFactory.setDefaultRequestProperties(headerMap);
         }
 
-        // 关键：TextureView/ExoPlayer 全部 UI 与播放器操作必须在主线程
+        // 关键：渲染层/ExoPlayer 全部 UI 与播放器操作必须在主线程
         // （插件方法运行在 CapacitorPlugins 线程，直接触碰 view 崩溃——P9.19 实测）
         getActivity().runOnUiThread(() -> {
             try {
                 releaseInternal(); // 复位旧实例
 
-                // 渲染层：挂在 content 底层（WebView 之下）—— P9.41 D55 层级翻转
-                // 历史做法（≤P9.38）把 TextureView 加在顶层盖住 WebView，WebView 内的
-                // 弹幕 canvas / OSD / 控制条全部被视频遮住（v1.3.11 起的已知限制）。
-                // 现改为：TextureView 在下（只负责渲染视频画面），WebView 在上且背景透明，
-                // 页面在原生播放态把 body 与视频区背景置 transparent「挖洞」，
-                // 于是下层视频从洞里透出、上层 WebView 里的弹幕浮在视频之上（层级正确）。
-                if (textureView == null) {
-                    textureView = new TextureView(getContext());
-                    textureView.setSurfaceTextureListener(surfaceListener);
-                    textureView.setOpaque(false);
+                // 渲染层：挂在 content 底层（WebView 之下）—— P9.41 D55 层级翻转。
+                // P9.46（Z7X 闪退对策）：TextureView → SurfaceView。TextureView 走 app 内
+                // GL 合成，老 GPU（Z7X 投影芯片）上驱动级崩溃风险高、每帧还有 GPU 拷贝；
+                // SurfaceView 由系统独立窗口合成、默认就在窗口层之下，与「视频在底、
+                // WebView 透明挖洞在上」的架构天然匹配，是老电视/投影最稳的渲染路径。
+                if (surfaceView == null) {
+                    surfaceView = new SurfaceView(getContext());
+                    surfaceView.getHolder().addCallback(surfaceCallback);
                     // P9.26 D42：渲染层纯展示——不响应焦点，避免抢遥控器按键
-                    textureView.setFocusable(false);
-                    // P9.28 D44：渲染层盖在 WebView 视频区上方，模拟器/触屏的点击会落在
-                    // 最顶层的 TextureView 上（不可点击也不一定穿透——MuMu 实测点击无反馈）。
-                    // 手动把触摸事件转发给 WebView（补回父级 offset 后派发），返回 true 消费
-                    // 本层事件防止父级二次派发。
-                    textureView.setOnTouchListener((v, event) -> {
+                    surfaceView.setFocusable(false);
+                    // P9.28 D44 触摸转发逻辑保留（SurfaceView 仍会参与事件派发）
+                    surfaceView.setOnTouchListener((v, event) -> {
                         android.webkit.WebView wv = getBridge() != null ? getBridge().getWebView() : null;
-                        if (wv == null || textureView == null) return false;
+                        if (wv == null || surfaceView == null) return false;
                         android.view.MotionEvent fwd = android.view.MotionEvent.obtain(event);
-                        fwd.offsetLocation(textureView.getLeft(), textureView.getTop());
+                        fwd.offsetLocation(surfaceView.getLeft(), surfaceView.getTop());
                         wv.dispatchTouchEvent(fwd);
                         fwd.recycle();
                         return true;
                     });
                     ViewGroup content = getActivity().findViewById(android.R.id.content);
                     // index 0 = 插到所有子视图最前（FrameLayout 后加者在上层）→ 渲染层沉底。
-                    // P9.44 教训：曾尝试先以 1×1 加入防首帧全屏拉伸，但模拟器上 1×1 的
-                    // TextureView 不会创建 SurfaceTexture（onSurfaceTextureAvailable 不触发），
-                    // 结果音频在播、画面全黑。改为：有缓存矩形用矩形，否则 MATCH_PARENT。
+                    // 有缓存矩形用矩形，否则 MATCH_PARENT（过小尺寸可能拿不到 surface）。
                     ViewGroup.LayoutParams initLp;
                     if (tgtW > 0 && tgtH > 0) {
                         initLp = new FrameLayout.LayoutParams(tgtW, tgtH);
@@ -255,13 +250,14 @@ public class NativePlayerPlugin extends Plugin {
                         initLp = new FrameLayout.LayoutParams(
                             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT);
                     }
-                    content.addView(textureView, 0, initLp);
+                    content.addView(surfaceView, 0, initLp);
                     if (tgtW > 0 && tgtH > 0) applyVideoFrame();
                 }
                 // 每次原生播放都重新确认 WebView 置顶 + 透明（防止其它视图抢上层）
                 bringWebViewToFront(getActivity().findViewById(android.R.id.content));
-                textureView.setVisibility(View.VISIBLE);
-                surfaceReady = textureView.isAvailable();
+                surfaceView.setVisibility(View.VISIBLE);
+                surfaceReady = surfaceView.getHolder().getSurface() != null
+                    && surfaceView.getHolder().getSurface().isValid();
                 rendering = true; // P9.29 D45：MainActivity 触摸拦截生效
 
                 player = buildPlayer(httpFactory);
@@ -348,8 +344,9 @@ public class NativePlayerPlugin extends Plugin {
 
                 player.setMediaItem(MediaItem.fromUri(url));
                 if (startMs > 0) player.seekTo((long) startMs);
-                if (videoSurface == null && textureView.getSurfaceTexture() != null) {
-                    videoSurface = new Surface(textureView.getSurfaceTexture());
+                if (videoSurface == null && surfaceView.getHolder().getSurface() != null
+                    && surfaceView.getHolder().getSurface().isValid()) {
+                    videoSurface = surfaceView.getHolder().getSurface();
                 }
                 if (videoSurface != null) {
                     player.setVideoSurface(videoSurface);
@@ -377,10 +374,10 @@ public class NativePlayerPlugin extends Plugin {
         final boolean stretch = call.getBoolean("stretch", false);
         getActivity().runOnUiThread(() -> {
             // P9.44：JS 常在 load() 之前就同步几何（nativePlayer.js / PlayerView 挂载时），
-            // 此时 textureView 还没建。原实现直接 resolve 丢弃矩形 → 新建的 TextureView
+            // 此时渲染层还没建。原实现直接 resolve 丢弃矩形 → 新建的渲染层
             // 以 MATCH_PARENT 加入，首帧全屏拉伸，要等下一次同步才纠正。
-            // 这里先记下目标矩形，随后新建 TextureView 时会立即 applyVideoFrame()。
-            if (textureView == null) {
+            // 这里先记下目标矩形，随后新建渲染层时会立即 applyVideoFrame()。
+            if (surfaceView == null) {
                 tgtX = x;
                 tgtY = y;
                 tgtW = w;
@@ -406,7 +403,7 @@ public class NativePlayerPlugin extends Plugin {
      *  - 未知帧尺寸：铺满占位区。须在 UI 线程调用。
      */
     private void applyVideoFrame() {
-        if (textureView == null) return;
+        if (surfaceView == null) return;
         int x = tgtX, y = tgtY, w = tgtW, h = tgtH;
         if (!stretchMode && videoW > 0 && videoH > 0 && tgtW > 0 && tgtH > 0) {
             double vw = videoW * videoSar;
@@ -425,14 +422,14 @@ public class NativePlayerPlugin extends Plugin {
         FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(Math.max(1, w), Math.max(1, h));
         lp.leftMargin = Math.max(0, x);
         lp.topMargin = Math.max(0, y);
-        textureView.setLayoutParams(lp);
+        surfaceView.setLayoutParams(lp);
     }
 
     /**
      * P9.41 D55：把 Capacitor WebView 提到 content 顶层并设为透明背景。
      * FrameLayout 中「后添加者在上层」，层级必须恒为：
      *   android.R.id.content
-     *     └─ TextureView（底：只渲染视频画面）
+     *     └─ SurfaceView（底：只渲染视频画面）
      *        └─ WebView（上：页面 UI + 弹幕 canvas，背景透明，视频区透出下层画面）
      * 顺序一旦颠倒，弹幕就会被视频盖住（v1.3.11~v1.3.20 的已知限制）。
      */
@@ -476,7 +473,7 @@ public class NativePlayerPlugin extends Plugin {
     @PluginMethod
     public void hide(PluginCall call) {
         getActivity().runOnUiThread(() -> {
-            if (textureView != null) textureView.setVisibility(View.GONE);
+            if (surfaceView != null) surfaceView.setVisibility(View.GONE);
             call.resolve();
         });
     }
@@ -491,8 +488,8 @@ public class NativePlayerPlugin extends Plugin {
     public void dim(PluginCall call) {
         final float alpha = (float) (double) call.getDouble("alpha", 1.0);
         getActivity().runOnUiThread(() -> {
-            if (textureView != null) {
-                textureView.setAlpha(Math.max(0f, Math.min(1f, alpha)));
+            if (surfaceView != null) {
+                surfaceView.setAlpha(Math.max(0f, Math.min(1f, alpha)));
             }
             call.resolve();
         });
@@ -615,10 +612,10 @@ public class NativePlayerPlugin extends Plugin {
     /**
      * 复位播放器（切清晰度/分P/退出播放都会走）
      *
-     * P9.44 长播内存修复：原实现每次都把 TextureView 从视图树 remove 并置 null，
-     * 于是「多集连播 = 反复新建 TextureView + SurfaceTexture + 匿名 Surface，且旧 Surface
-     * 从不 release」，是长时间观看内存持续增长与硬解崩溃的主要来源。
-     * 现在 TextureView 常驻复用（仅 GONE），Surface 走 releaseSurface() 显式释放；
+     * P9.44 长播内存修复：原实现每次都把渲染层从视图树 remove 并置 null，
+     * 于是「多集连播 = 反复新建渲染层 + Surface，且旧 Surface 从不 release」，
+     * 是长时间观看内存持续增长与硬解崩溃的主要来源。
+     * 现在渲染层常驻复用（仅 GONE），Surface 摘挂走 releaseSurface()；
      * 彻底销毁只在 handleOnDestroy 做。
      */
     private void releaseInternal() {
@@ -637,8 +634,8 @@ public class NativePlayerPlugin extends Plugin {
             }
             player = null;
         }
-        if (textureView != null) {
-            textureView.setVisibility(View.GONE); // 复用，不 remove（保持 index 0 的层级）
+        if (surfaceView != null) {
+            surfaceView.setVisibility(View.GONE); // 复用，不 remove（保持 index 0 的层级）
         }
         pendingStart = false;
         ioRetryCount = 0;
@@ -660,10 +657,11 @@ public class NativePlayerPlugin extends Plugin {
     @Override
     protected void handleOnResume() {
         rendering = false; // 桥重建场景：抹掉可能残留的静态标记
-        if (player == null || textureView == null) return;
+        if (player == null || surfaceView == null) return;
         try {
-            if (textureView.getSurfaceTexture() != null && videoSurface == null) {
-                videoSurface = new android.view.Surface(textureView.getSurfaceTexture());
+            Surface s = surfaceView.getHolder().getSurface();
+            if (s != null && s.isValid() && videoSurface == null) {
+                videoSurface = s;
             }
             if (videoSurface != null) {
                 surfaceReady = true;
@@ -678,10 +676,10 @@ public class NativePlayerPlugin extends Plugin {
     protected void handleOnDestroy() {
         releaseInternal();
         // 真正销毁时才从视图树摘除渲染层
-        if (textureView != null) {
-            android.view.ViewParent parent = textureView.getParent();
-            if (parent instanceof ViewGroup) ((ViewGroup) parent).removeView(textureView);
-            textureView = null;
+        if (surfaceView != null) {
+            android.view.ViewParent parent = surfaceView.getParent();
+            if (parent instanceof ViewGroup) ((ViewGroup) parent).removeView(surfaceView);
+            surfaceView = null;
         }
     }
 }

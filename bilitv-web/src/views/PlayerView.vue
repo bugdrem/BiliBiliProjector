@@ -707,10 +707,20 @@ function handleNativeError(d) {
     return
   }
   const dec = effectiveDecoder()
-  const chain = dec === 'hw' ? ['sw', 'webview'] : dec === 'sw' ? ['webview'] : []
+  // P9.46（Z7X 闪退对策）：WebView 内核在 Z7X 上必崩（MSE/DURL 原生崩溃），且上一次
+  // 会话检测到异常退出（crashDetected）时，降级链里不能再进 WebView——否则
+  // 「原生失败 → 降级 WebView → 闪退 → 下次强制原生 → 再失败」死循环。
+  // 高危会话下原生失败就停住并提示，让用户手动切解码器。
+  const webviewAllowed = !runtimeSession.crashDetected && !runtimeSession.emulator
+  const chain =
+    dec === 'hw'
+      ? ['sw', ...(webviewAllowed ? ['webview'] : [])]
+      : dec === 'sw'
+        ? webviewAllowed ? ['webview'] : []
+        : []
   const next = chain[0]
   if (!next) {
-    toastError(new Error('原生播放错误：' + (d.message || 'unknown')))
+    toastError(new Error('原生播放错误：' + (d.message || 'unknown') + '（可到设置页切换解码器重试）'))
     showOsd()
     return
   }
