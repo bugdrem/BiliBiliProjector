@@ -9,7 +9,7 @@
  */
 
 import { Capacitor, CapacitorHttp } from '@capacitor/core'
-import { ApiError } from './http.js'
+import { ApiError, webHeaders, ensureSession } from './http.js'
 
 const isDev =
   typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.DEV
@@ -17,11 +17,18 @@ const isDev =
 /** passport 基地址：dev 走代理，生产直连 */
 const PASSPORT_BASE = isDev ? '/bpass' : 'https://passport.bilibili.com'
 
-/** 原生 GET（返回 json + 原始响应头，供 Set-Cookie 解析） */
+/**
+ * 原生 GET（返回 json + 原始响应头，供 Set-Cookie 解析）
+ * P9.43：带全局 web 端画像（桌面 UA + passport 登录页 Referer + buvid Cookie），
+ * 与 passort 站点正常浏览器访问一致，降低扫码/轮询被判定异常的概率。
+ */
 async function nativeGet(pathWithQuery) {
+  await ensureSession() // buvid 会话就绪后 Cookie 才会带上
   const res = await CapacitorHttp.get({
     url: `${PASSPORT_BASE}${pathWithQuery}`,
-    headers: { Accept: 'application/json, text/plain, */*' },
+    headers: webHeaders(pathWithQuery, {
+      Referer: 'https://passport.bilibili.com/login'
+    }),
     connectTimeout: 10000,
     readTimeout: 10000
   })

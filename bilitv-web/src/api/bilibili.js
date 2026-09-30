@@ -7,7 +7,7 @@
 
 import { inflate, inflateRaw } from 'pako'
 import { Capacitor, CapacitorHttp } from '@capacitor/core'
-import { apiGet, ApiError, ensureSession, getCookieHeader, API_BASE } from './http.js'
+import { apiGet, ApiError, nativeGetJson, WEB_UA, API_BASE } from './http.js'
 import { signedQuery } from './wbi.js'
 import { auth } from '../stores/auth.js'
 
@@ -104,7 +104,7 @@ export async function getRanking(rid = 0) {
   // P9.35 D51：对齐 web 排行榜页请求（桌面 UA + 排行榜页 Referer，CapacitorHttp 直调
   // 防 fetch shim 剥离 forbidden headers）；web 开发环境走 apiGet（Vite 代理）
   if (Capacitor.isNativePlatform()) {
-    const data = await nativeGet(`/x/web-interface/ranking/v2?rid=${Number(rid) || 0}&type=all`, RANK_HEADERS)
+    const data = await nativeGetJson(`/x/web-interface/ranking/v2?rid=${Number(rid) || 0}&type=all`, RANK_HEADERS)
     return (data.list || []).map(toCard).filter(Boolean)
   }
   const data = await apiGet('/x/web-interface/ranking/v2', { rid, type: 'all' }, { headers: RANK_HEADERS })
@@ -151,43 +151,21 @@ const WEEKLY_HEADERS = {
   'User-Agent': WEEKLY_UA
 }
 
-/** 桌面 Chrome UA（P9.35 D51）：排行榜等风控敏感接口对齐 web 页请求 */
-const DESKTOP_UA =
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+/** 桌面 Chrome UA（P9.35 D51）：与 http.js 的全局 WEB_UA 同源，避免多支 UA 不一致 */
+const DESKTOP_UA = WEB_UA
 const RANK_HEADERS = {
   Referer: 'https://www.bilibili.com/v/popular/rank/all/',
   'User-Agent': DESKTOP_UA
 }
 
-/** 原生通道直调（CapacitorHttp headers 无 forbidden 剥离，Cookie 显式下发）。
- *  P9.35 D51：泛化自 weeklyGet，排行榜等接口复用 */
-async function nativeGet(pathWithQuery, extraHeaders = {}) {
-  await ensureSession()
-  const cookie = getCookieHeader()
-  const headers = { ...extraHeaders }
-  if (cookie) headers.Cookie = cookie
-  const res = await CapacitorHttp.get({
-    url: `${API_BASE}${pathWithQuery}`,
-    headers,
-    connectTimeout: 10000,
-    readTimeout: 10000
-  })
-  let json = res.data
-  if (typeof json === 'string') {
-    try {
-      json = JSON.parse(json)
-    } catch (_) {
-      throw new ApiError(-1, `HTTP ${res.status} 响应解析失败`)
-    }
-  }
-  if (json.code !== 0) {
-    throw new ApiError(json.code, json.code === -352 || json.code === -412 ? '请求被风控拦截，请稍后再试' : json.message || '接口返回异常')
-  }
-  return json.data
-}
-
+/**
+ * 原生通道直调（CapacitorHttp headers 无 forbidden 剥离，Referer/UA/Cookie 全透传）。
+ * P9.35 D51 泛化自 weeklyGet；P9.43 起统一复用 http.js 的 nativeGetJson——
+ * 原先本函数自己发请求，**绕开了限频闸门**（连续请求无间隔，是风控暴露面），
+ * 现在限频/重试/风控码翻译与 apiGet 完全一致。
+ */
 function weeklyGet(pathWithQuery) {
-  return nativeGet(pathWithQuery, WEEKLY_HEADERS)
+  return nativeGetJson(pathWithQuery, WEEKLY_HEADERS)
 }
 
 /**
@@ -307,7 +285,7 @@ export async function getUpArchives(mid, page = 1) {
     'User-Agent': DESKTOP_UA
   }
   const data = Capacitor.isNativePlatform()
-    ? await nativeGet(`/x/space/wbi/arc/search?${qs}`, headers)
+    ? await nativeGetJson(`/x/space/wbi/arc/search?${qs}`, headers)
     : await apiGet('/x/space/wbi/arc/search', qs, { headers })
   const vlist = (data.list && data.list.vlist) || []
   const list = vlist
@@ -554,10 +532,15 @@ export async function getDanmakuXml(cid) {
     if (Capacitor.isNativePlatform()) {
       // 原生：fetch shim 会把 deflate 二进制按文本解码（bytes 损坏、解压必败），
       // 必须走 CapacitorHttp arraybuffer（base64 透传）
+      // P9.43：带上 web 视频页画像（Referer/UA），避免 comment 端点误判为异常直连
       const res = await CapacitorHttp.get({
         url,
         responseType: 'arraybuffer',
-        headers: { Accept: '*/*' },
+        headers: {
+          Accept: '*/*',
+          Referer: 'https://www.bilibili.com/video/',
+          'User-Agent': WEB_UA
+        },
         connectTimeout: 10000,
         readTimeout: 10000
       })

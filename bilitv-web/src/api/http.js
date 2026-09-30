@@ -1,16 +1,25 @@
+import { Capacitor, CapacitorHttp } from '@capacitor/core'
+
 /**
  * 统一 HTTP 请求封装
  *
  * 双环境传输策略（核心，见 docs/01-开发文档.md 第二、四章）：
  *  - 开发期：API_BASE = '/bapi'，由 Vite dev server 代理转发到 api.bilibili.com，
  *    Node 侧转发不携带浏览器 Origin 头 → 绕开 B 站 WAF 的 Origin 白名单。
- *  - APK 生产：API_BASE = 'https://api.bilibili.com'，window.fetch 已被
- *    CapacitorHttp 接管为原生 HTTP（无 Origin、无 CORS 限制）。
+ *  - APK 生产：API_BASE = 'https://api.bilibili.com'。
+ *
+ * P9.43 风控加固（"全局走 bilibili web 端形态"）：
+ *  设备侧 fetch 已被 CapacitorHttp patch 接管，但 shim 构造 Request 时 Referer/UA
+ *  属 forbidden headers，会被引擎静默剥离 → 请求失去 web 端特征，成为风控面上的"异常
+ *  客户端"（P0 实测：-352 / -412 均由此而来）。因此**所有** API 请求在原生环境下统一
+ *  走 CapacitorHttp 直调（headers 全透传），并按接口注入对应 web 页面 Referer + 桌面 UA，
+ *  尽量贴近真实浏览器访问画像；web/开发期仍走 Vite 代理（服务端同样可带 Referer）。
  *
  * 通用约定：
  *  - 业务码 code!==0 抛 ApiError；-412 / -352 识别为风控拦截（文案特殊化）
  *  - 网络/5xx 错误自动重试 1 次；业务错误不重试
- *  - 同 host 请求间隔 ≥ 300ms（串行队列），降低触发风控的概率
+ *  - 同 host 请求间隔 ≥ 300ms（串行队列），降低触发风控的概率；
+ *    原生直调同样纳入该限频闸门（此前 nativeGet 绕过限频，是风控隐患）
  */
 
 /** API 基地址：开发走代理，生产直连（CapacitorHttp 原生执行） */
@@ -34,6 +43,105 @@ export class ApiError extends Error {
 
 /** 风控拦截码：-412 请求被拦截 / -352 风控校验失败 */
 const RISK_CODES = new Set([-412, -352])
+
+/* ---------------- web 端请求画像（P9.43） ----------------
+ * 设备侧的原生请求必须"长得像浏览器"，否则 B 站按未知客户端处理风控。
+ * UA 固定为桌面 Chrome（与 ranking/weekly 已验证通过的那支一致）。
+ */
+export const WEB_UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
+
+/**
+ * 接口 → 对应 web 页面 Referer：B 站部分端点会校验 Referer 站点
+ * （ranking 无 Referer 直接 -352，P0 实测）。按最长前缀匹配，未命中给首页兜底。
+ */
+const REFERER_RULES = [
+  [/^\/x\/web-interface\/ranking/, 'https://www.bilibili.com/v/popular/rank/all/'],
+  [/^\/x\/web-interface\/popular\/series/, 'https://www.bilibili.com/v/popular/weekly'],
+  [/^\/x\/web-interface\/popular\/precious/, 'https://www.bilibili.com/v/popular/history'],
+  [/^\/x\/web-interface\/wbi\/search|^\/x\/web-interface\/search/, 'https://search.bilibili.com/'],
+  [/^\/x\/space\//, 'https://space.bilibili.com/'],
+  [/^\/x\/web-interface\/view|^\/x\/player\//, 'https://www.bilibili.com/video/'],
+  [/^\/x\/v1\/dm\/|^\/x\/v2\/dm\//, 'https://www.bilibili.com/video/'],
+  [/^\/x\/web-interface\/archive\/related/, 'https://www.bilibili.com/video/'],
+  [/^\/x\/click-interface\//, 'https://www.bilibili.com/video/'],
+  [/^\/x\/relation\/|^\/x\/v2\/fav\//, 'https://space.bilibili.com/']
+]
+
+/** 取接口对应的 web 页面 Referer（未命中回落到 bilibili 首页） */
+export function refererFor(path = '') {
+  for (const [re, ref] of REFERER_RULES) {
+    if (re.test(path)) return ref
+  }
+  return 'https://www.bilibili.com/'
+}
+
+/**
+ * 组装 web 端标准请求头（UA + Referer + Accept + Cookie）
+ * @param {string} path 接口路径（用于推导 Referer）
+ * @param {Record<string,string>} extra 覆盖项（显式传的优先）
+ */
+export function webHeaders(path = '', extra = {}) {
+  const headers = {
+    Accept: 'application/json, text/plain, */*',
+    'Accept-Language': 'zh-CN,zh;q=0.9',
+    Referer: refererFor(path),
+    'User-Agent': WEB_UA,
+    ...extra
+  }
+  const cookie = cookieHeader()
+  if (cookie) headers.Cookie = cookie
+  return headers
+}
+
+/**
+ * 单次传输：原生环境走 CapacitorHttp 直调（headers 全透传），否则 fetch（dev 代理）
+ * 注：不同传输各自的异常都收敛为 Error，由上层统一重试/翻译
+ * @returns {Promise<{status:number, data:any}>}
+ */
+async function transmit(url, method, headers, body, timeout, responseType = 'json') {
+  if (Capacitor.isNativePlatform()) {
+    const res = await CapacitorHttp.request({
+      url,
+      method,
+      headers,
+      ...(body ? { data: body } : {}),
+      responseType,
+      connectTimeout: 10000,
+      readTimeout: timeout
+    })
+    const status = res.status || 0
+    if (status >= 500) throw new Error(`HTTP ${status}`)
+    return { status, data: responseType === 'text' ? res.data : res.data }
+  }
+
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), timeout)
+  try {
+    const res = await fetch(url, {
+      method,
+      headers,
+      signal: ctrl.signal,
+      credentials: 'omit',
+      referrerPolicy: 'no-referrer',
+      ...(body ? { body } : {})
+    })
+    if (res.status >= 500) throw new Error(`HTTP ${res.status}`)
+    return { status: res.status, data: responseType === 'text' ? await res.text() : await res.json() }
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/** 统一的业务码翻译（命中风控码时文案特殊化） */
+function assertOk(json) {
+  if (!json || json.code !== 0) {
+    const code = json ? json.code : -1
+    if (RISK_CODES.has(code)) throw new ApiError(code, '请求被风控拦截，请稍后再试')
+    throw new ApiError(code, (json && json.message) || '接口返回异常')
+  }
+  return json.data
+}
 
 /** 上一次请求完成时间戳（毫秒），用于最小间隔限频 */
 let lastRequestAt = 0
@@ -180,46 +288,18 @@ export function buildQuery(params) {
  * @param {{wbi?: boolean, timeout?: number}} [opts] wbi=true 时由 wbi.js 预签名后传入字符串参数
  * @returns {Promise<any>} B 站响应中的 data 字段
  */
-export async function apiGet(path, params = {}, opts = {}) {
-  const { timeout = 10000, headers: extraHeaders = {} } = opts
-  const qs = typeof params === 'string' ? params : buildQuery(params)
-  const url = `${API_BASE}${path}${qs ? '?' + qs : ''}`
-
-  // 请求前确保设备指纹就绪（风控接口需要 buvid3）
-  await ensureSession()
-  const headers = { Accept: 'application/json, text/plain, */*', ...extraHeaders }
-  const cookie = cookieHeader()
-  if (cookie) headers.Cookie = cookie // 浏览器环境自动忽略；原生/代理环境生效
-
+/**
+ * 带限频 + 一次重试 + 业务码翻译的请求执行器
+ * @param {() => Promise<{status:number, data:any}>} send 单次传输闭包
+ */
+async function requestWithRetry(send) {
   let lastErr
   // 最多两次尝试：首次失败（网络/5xx）后重试一次
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       await gate()
-      const ctrl = new AbortController()
-      const timer = setTimeout(() => ctrl.abort(), timeout)
-      let res
-      try {
-        res = await fetch(url, {
-          signal: ctrl.signal,
-          credentials: 'omit',
-          referrerPolicy: 'no-referrer',
-          headers
-        })
-      } finally {
-        clearTimeout(timer)
-      }
-
-      if (res.status >= 500) throw new Error(`HTTP ${res.status}`)
-      const json = await res.json()
-
-      if (json.code !== 0) {
-        if (RISK_CODES.has(json.code)) {
-          throw new ApiError(json.code, '请求被风控拦截，请稍后再试')
-        }
-        throw new ApiError(json.code, json.message || '接口返回异常')
-      }
-      return json.data
+      const { data } = await send()
+      return assertOk(data)
     } catch (err) {
       // 业务错误（含风控）不重试，直接上抛
       if (err instanceof ApiError) throw err
@@ -228,8 +308,34 @@ export async function apiGet(path, params = {}, opts = {}) {
       await sleep(600) // 退避后重试
     }
   }
-const reason = lastErr && lastErr.name === 'AbortError' ? '请求超时' : '网络异常，请检查设备联网'
+  const reason =
+    lastErr && lastErr.name === 'AbortError' ? '请求超时' : '网络异常，请检查设备联网'
   throw new ApiError(-1, reason)
+}
+
+export async function apiGet(path, params = {}, opts = {}) {
+  const { timeout = 10000, headers: extraHeaders = {} } = opts
+  const qs = typeof params === 'string' ? params : buildQuery(params)
+  const url = `${API_BASE}${path}${qs ? '?' + qs : ''}`
+
+  // 请求前确保设备指纹就绪（风控接口需要 buvid3）
+  await ensureSession()
+  const headers = webHeaders(path, extraHeaders)
+  return requestWithRetry(() => transmit(url, 'GET', headers, null, timeout, 'json'))
+}
+
+/**
+ * 原生通道 GET（供对 Referer/UA 敏感、必须直调的接口使用，见 bilibili.js）。
+ * 与 apiGet 的区别仅在于允许完整覆盖请求头；同样受限频、重试、风控翻译保护。
+ * @param {string} pathWithQuery 带 query 的接口路径
+ * @param {Record<string,string>} extraHeaders 覆盖项（通常含专属 Referer）
+ */
+export async function nativeGetJson(pathWithQuery, extraHeaders = {}) {
+  const path = String(pathWithQuery).split('?')[0]
+  await ensureSession()
+  const headers = webHeaders(path, extraHeaders)
+  const url = `${API_BASE}${pathWithQuery}`
+  return requestWithRetry(() => transmit(url, 'GET', headers, null, 10000, 'json'))
 }
 
 /**
@@ -242,44 +348,11 @@ const reason = lastErr && lastErr.name === 'AbortError' ? '请求超时' : '网�
 export async function apiPost(path, params = {}) {
   const url = `${API_BASE}${path}`
   await ensureSession()
-  const headers = {
-    Accept: 'application/json, text/plain, */*',
+  const headers = webHeaders(path, {
     'Content-Type': 'application/x-www-form-urlencoded'
-  }
-  const cookie = cookieHeader()
-  if (cookie) headers.Cookie = cookie
-
+  })
   const body = buildQuery(params)
-  let lastErr
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      await gate()
-      const ctrl = new AbortController()
-      const timer = setTimeout(() => ctrl.abort(), 10000)
-      let res
-      try {
-        res = await fetch(url, { method: 'POST', body, headers, signal: ctrl.signal })
-      } finally {
-        clearTimeout(timer)
-      }
-      if (res.status >= 500) throw new Error(`HTTP ${res.status}`)
-      const json = await res.json()
-      if (json.code !== 0) {
-        if (RISK_CODES.has(json.code)) {
-          throw new ApiError(json.code, '请求被风控拦截，请稍后再试')
-        }
-        throw new ApiError(json.code, json.message || '接口返回异常')
-      }
-      return json.data
-    } catch (err) {
-      if (err instanceof ApiError) throw err
-      lastErr = err
-      if (attempt === 1) break
-      await sleep(600)
-    }
-  }
-  const reason = lastErr && lastErr.name === 'AbortError' ? '请求超时' : '网络异常，请检查设备联网'
-  throw new ApiError(-1, reason)
+  return requestWithRetry(() => transmit(url, 'POST', headers, body, 10000, 'json'))
 }
 
 /**
@@ -300,11 +373,9 @@ export async function rawGet(path, params = {}) {
  * @returns {Promise<string>}
  */
 export async function getText(pathWithQuery) {
+  await ensureSession()
+  const headers = webHeaders(pathWithQuery, { Accept: '*/*' })
   await gate()
-  const res = await fetch(`${API_BASE}${pathWithQuery}`, {
-    credentials: 'omit',
-    referrerPolicy: 'no-referrer'
-  })
-  if (!res.ok) throw new ApiError(-1, `HTTP ${res.status}`)
-  return res.text()
+  const { data } = await transmit(`${API_BASE}${pathWithQuery}`, 'GET', headers, null, 10000, 'text')
+  return data
 }
