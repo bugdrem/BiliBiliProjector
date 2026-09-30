@@ -26,6 +26,22 @@ function withTimeout(promise, ms) {
   ])
 }
 
+/**
+ * 应用版本信息（P9.44）：设置页底栏展示，形如 `BiliTV-v1.3.21-release`
+ * 非原生环境（Web/开发）返回 web 兜底，避免底栏空白或报错。
+ */
+export async function probeAppVersion() {
+  const fallback = { versionName: 'dev', versionCode: 0, buildType: 'web' }
+  if (!Capacitor.isNativePlatform()) return fallback
+  try {
+    const r = await withTimeout(DeviceProbe.getAppVersion(), 4000)
+    if (r && r.versionName) return r
+  } catch (_) {
+    /* 插件不可用：走兜底 */
+  }
+  return fallback
+}
+
 /** 设备信息（原生或 Web 回退） */
 export async function probeDeviceInfo() {
   if (Capacitor.isNativePlatform()) {

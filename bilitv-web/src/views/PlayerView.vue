@@ -13,7 +13,7 @@ import { auth } from '../stores/auth'
 import { hasFav, favDeal, getDefaultFolderId, reportHistory, heartBeat } from '../api/cloud'
 import { MsePlayer } from '../player/msePlayer'
 import {
-  nativePlayerAvailable, nativeLoad, nativeLayout, nativeDim, nativePlay, nativePause,
+  nativePlayerAvailable, nativeLoad, nativeLayout, nativePlay, nativePause,
   nativeSeekTo, nativeSetSpeed, nativeGetProgress, nativeRelease, nativeOn
 } from '../player/nativePlayer'
 import { focusEngine } from '../core/focus'
@@ -588,25 +588,6 @@ function releaseHole() {
   document.body.classList.remove('play-fullscreen')
 }
 
-/** 全屏播放态（P9.42）：清零外层容器 padding，视频才能真正铺满屏幕（否则四周露灰边） */
-const fullscreen = computed(() => !ended.value && settings.videoFit !== 'window')
-watch(
-  () => fullscreen.value,
-  (on) => {
-    if (typeof document === 'undefined') return
-    document.body.classList.toggle('play-fullscreen', !!on)
-  },
-  { immediate: true }
-)
-
-/** 播完回到双栏后重同步渲染层几何：定格画面要跟着回到新的视频区位置 */
-watch(
-  () => ended.value,
-  (v) => {
-    if (v) nextTick(() => syncNativeLayout())
-  }
-)
-
 /** 打开模态面板（P9.30 D46）：统一挂 onClose——硬件返回键 back() 弹层时
  *  同步清 panel 状态，修复"返回只弹层、弹框一直在" */
 function openPanel(p) {
@@ -857,8 +838,11 @@ function startHeartbeat() {
   if (!auth.loggedIn || !video.value || !video.value.aid) return
   hbLastAt = Math.floor(Date.now() / 1000)
   hbTimer = setInterval(() => {
-    const el = videoEl.value
-    if (!el || el.paused || !curTime.value) return // 暂停/未起播不发（避免 played_time 回退）
+    // P9.44：原生内核下没有 <video> 元素，暂停判定改看 playing / nativeMode
+    if (nativeMode.value ? !playing.value || !curTime.value : true) {
+      const el = videoEl.value
+      if (!el || el.paused || !curTime.value) return // 暂停/未起播不发（避免 played_time 回退）
+    }
     const now = Math.floor(Date.now() / 1000)
     const interval = now - hbLastAt
     if (interval < 10) return // tick 抖动保护
@@ -1013,6 +997,27 @@ const ended = ref(false)
 const countdown = ref(0) // 倒计时秒数；0 = 未在倒计时
 let cdTimer = 0
 
+/** 全屏播放态（P9.42）：清零外层容器 padding，视频才能真正铺满屏幕（否则四周露灰边）。
+ *  P9.44 修正：此块原先放在 setup 前段（ended 定义之前），watch 创建即求值 getter，
+ *  触发 `Cannot access 'ended' before initialization`（TDZ），起播链路直接中断降级。 */
+const fullscreen = computed(() => !ended.value && settings.videoFit !== 'window')
+watch(
+  () => fullscreen.value,
+  (on) => {
+    if (typeof document === 'undefined') return
+    document.body.classList.toggle('play-fullscreen', !!on)
+  },
+  { immediate: true }
+)
+
+/** 播完回到双栏后重同步渲染层几何：定格画面要跟着回到新的视频区位置 */
+watch(
+  () => ended.value,
+  (v) => {
+    if (v) nextTick(() => syncNativeLayout())
+  }
+)
+
 function startCountdown() {
   clearInterval(cdTimer)
   countdown.value = settings.autoNextDelay || 5
@@ -1079,11 +1084,43 @@ watch(playing, (p) => {
 
 /* ---------------- OSD ---------------- */
 
+/**
+ * P9.44：判断焦点是否已在 OSD 的最后一行（下方没有同分区可聚焦元素）。
+ * 用于把「↓ 唤出接下来播放」限制在最后一行触发，避免抢走 OSD 内部的空间导航。
+ */
+function isOsdLastRow() {
+  const cur = focusEngine.current
+  if (!cur || !cur.getBoundingClientRect) return true
+  const cr = cur.getBoundingClientRect()
+  let maxBottom = cr.bottom
+  document.querySelectorAll('[data-focus-zone="osd"] [data-focusable], [data-focus-zone="osd"] [v-focusable]').forEach((el) => {
+    const r = el.getBoundingClientRect()
+    if (r.width > 0 && r.height > 0 && r.bottom > maxBottom) maxBottom = r.bottom
+  })
+  return cr.bottom >= maxBottom - 8
+}
+
 function showOsd() {
   if (osdVisible.value) return
   osdVisible.value = true
-  nextTick(() => focusEngine.pushLayer('osd'))
+  nextTick(() => {
+    // P9.44：pushLayer 补 onClose——任何关闭路径（硬件返回/UI/Esc）都同步清状态，
+    // 避免 osd 层残留导致返回键要按多次才退出播放页
+    focusEngine.pushLayer('osd', null, () => { osdVisible.value = false })
+  })
   armOsdTimer()
+}
+
+/**
+ * P9.44：关闭 OSD——只弹**当前栈顶确为 osd 层**的那层，避免误弹上层面板/弹窗
+ * （原实现无条件 popLayer，会把别的层弹掉，焦点与层级错位）
+ */
+function closeOsdLayer() {
+  const stack = focusEngine.layerStack
+  const top = stack && stack.length ? stack[stack.length - 1] : null
+  if (!top || top.zone !== 'osd') return false
+  focusEngine.popLayer()
+  return true
 }
 
 function hideOsd() {
@@ -1097,7 +1134,7 @@ function hideOsd() {
   if (top && top.trigger && top.trigger.closest && top.trigger.closest('[data-focus-zone="osd"]')) {
     top.trigger = null
   }
-  focusEngine.popLayer()
+  closeOsdLayer() // P9.44：栈顶校验，避免误弹其它层
   osdVisible.value = false
 }
 
@@ -1275,6 +1312,10 @@ function playerKeyHandler(key, e) {
     }
     if (key === 'ArrowDown') {
       // P9.32 D48：菜单显示态 ↓ → 底部弹出「接下来播放」横条（菜单让位）
+      // P9.44 修正（阻塞）：原先无条件拦截 ↓，OSD 内**永远拿不到向下导航**——
+      // .osd-controls 在 720p/窗口模式下换行成两行时，第二行按钮（选集/倍速/弹幕/连播）
+      // 遥控器根本选不中。现在只有焦点已在 OSD 最后一行（下方无可聚焦元素）才唤出横条。
+      if (!isOsdLastRow()) return false
       openNextStrip()
       return true
     }
@@ -1290,6 +1331,11 @@ function playerKeyHandler(key, e) {
     }
     return false
   }
+
+  // P9.44 修正（阻塞）：结束页/相关推荐下方向键必须交给空间导航。
+  // 原逻辑把 ←/→ 一律当 ±10s 快进，于是焦点在「相关推荐」纵向列表时按左右键
+  // 不是移动焦点而是快进已结束的视频并弹 HUD（倒计时期间同样）。
+  if (ended.value) return false
 
   // OSD 隐藏态：bbll 式 seek 语义优先于焦点空间导航——
   // ←/→ 短按 ±10s、长按连进（450ms 判定，越按越快）；e.repeat 的自动重复一律忽略
@@ -1349,17 +1395,19 @@ function onTimeUpdate() {
 
 function saveProgress() {
   const v = video.value
-  const el = videoEl.value
-  if (!v || !el || !el.currentTime) return
+  // P9.44 修复（阻塞）：原生内核是 Z7X 的主路径，此时 <video> 不渲染、videoEl 恒为 null，
+  // 原 `!el` 判断导致进度**永不落历史**（退出后无法续播）。原生模式改用轮询回填的 curTime。
+  const t = nativeMode.value ? curTime.value : videoEl.value ? videoEl.value.currentTime : 0
+  if (!v || !t) return
   histAdd(
     { bvid: v.bvid, title: v.title, pic: v.pic, owner: v.owner, duration: v.duration },
     curCid.value,
     v.pages[partIdx.value] ? v.pages[partIdx.value].page : 1,
-    el.currentTime
+    t
   )
   // 登录态：同步上报云端观看历史（静默失败，不干扰本地记录）
   if (auth.loggedIn && v.aid) {
-    reportHistory(v.aid, curCid.value, Math.floor(el.currentTime)).catch(() => {})
+    reportHistory(v.aid, curCid.value, Math.floor(t)).catch(() => {})
   }
 }
 
@@ -1502,7 +1550,9 @@ onUnmounted(() => {
               </div>
               <div class="osd-time">{{ curText }} / {{ durText }}</div>
               <div class="osd-controls">
-                <button v-focusable class="osd-btn" @click="togglePlay">
+                <!-- P9.44：默认焦点落在「播放/暂停」而非左上角返回键
+                     （原默认取分区首个可聚焦元素 = 返回，误按两次 OK 就退出播放页） -->
+                <button v-focusable class="osd-btn" data-autofocus @click="togglePlay">
                   {{ playing ? '⏸ 暂停' : '▶ 播放' }}
                 </button>
                 <button v-focusable class="osd-btn" @click="openPanel('info')">ℹ 视频信息</button>
@@ -1876,6 +1926,8 @@ onUnmounted(() => {
   height: 100%;
   display: block;
   background: #000;
+  /* P9.44：结束态下 aspect-ratio 与 max-height 同时生效时画面被拉伸变形 */
+  object-fit: contain;
 }
 
 /* 原生渲染占位盒（D39 / D55 层级翻转）：TextureView 覆盖此区域。
@@ -2213,14 +2265,17 @@ body.native-play .side-column {
 
 
 /* 左上角返回（P9.36 D52） */
+/* P9.44：原热区约 34px、字号 18px，低于 TV 基准（≥60px / ≥20px），
+   且它曾是 OSD 默认焦点，误触直接退出播放页 → 同步放大并加粗描边 */
 .osd-back {
   flex-shrink: 0;
   background: rgba(0, 0, 0, 0.5);
   border: 1px solid rgba(255, 255, 255, 0.35);
   border-radius: 10px;
   color: var(--text);
-  font-size: 18px;
-  padding: 6px 14px;
+  font-size: 20px;
+  min-height: 60px;
+  padding: 10px 20px;
   margin-right: 14px;
 }
 

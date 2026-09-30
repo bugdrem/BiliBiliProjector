@@ -4,7 +4,7 @@
  * 行内开关 Enter 切换；清除数据与退出登录带确认模态。
  * 账号行：未登录 → 跳我的页扫码；已登录 → 确认退出。
  */
-import { ref, computed, nextTick } from 'vue'
+import { ref, computed, nextTick, onUnmounted } from 'vue'
 import { settings, histClear } from '../stores/app'
 import { CODEC_OPTIONS } from '../api/bilibili'
 import { auth, logout as authLogout } from '../stores/auth'
@@ -12,10 +12,24 @@ import { focusEngine } from '../core/focus'
 import { navigate } from '../router'
 import { toast } from '../utils/toast'
 import { previewThemeSound } from '../utils/sounds'
-import { probeDeviceInfo, runCpuBenchmark, analyzeDevice } from '../utils/deviceProbe'
+import { probeDeviceInfo, runCpuBenchmark, analyzeDevice, probeAppVersion } from '../utils/deviceProbe'
 
 /** 弹幕透明度档位 */
 const OPACITY_STEPS = [0.5, 0.7, 0.85, 1]
+
+/**
+ * 底栏版本信息（P9.44）：形如 `BiliTV-v1.3.21-release`
+ * 原底栏写死 "BiliTV-Web v0.2.0"（多版本前的残留），与实际交付包完全对不上，
+ * 排查设备问题时无法确认装的是哪个包。现在从原生 PackageManager + BuildConfig 取真实值。
+ */
+const appVersion = ref('BiliTV')
+probeAppVersion().then((v) => {
+  if (v && v.versionName && v.versionName !== 'dev') {
+    appVersion.value = `BiliTV-v${v.versionName}-${v.buildType || 'release'}`
+  } else {
+    appVersion.value = 'BiliTV（Web 预览）'
+  }
+})
 
 /** 账号行展示（P9.0：等级/硬币/大会员，nav 字段修复后自动刷新） */
 const accountText = computed(() => {
@@ -212,7 +226,16 @@ function openCascade(key, e) {
     anchorEl
   }
   nextTick(() => {
-    focusEngine.pushLayer('cascade')
+    // P9.44：pushLayer 补 onClose——任何关闭路径都复位 cascade 并摘除拦截器。
+    // 原先只在 closeCascade() 里摘，若通过硬件返回/切路由关闭，拦截器会永久留在
+    // focusEngine 里并闭包持有已卸载组件（幽灵拦截）。
+    focusEngine.pushLayer('cascade', null, () => {
+      cascade.value = null
+      if (cascadeRemoveInterceptor) {
+        cascadeRemoveInterceptor()
+        cascadeRemoveInterceptor = null
+      }
+    })
     const cur = document.querySelector('.cascade-item.cur') || document.querySelector('.cascade-item')
     if (cur) focusEngine.focus(cur)
   })
@@ -237,6 +260,14 @@ function closeCascade() {
   focusEngine.popLayer()
   if (c && c.anchorEl && document.contains(c.anchorEl)) focusEngine.focus(c.anchorEl)
 }
+
+/** P9.44：卸载兜底——级联开着直接切路由时摘掉拦截器，避免幽灵拦截后续页面 */
+onUnmounted(() => {
+  if (cascadeRemoveInterceptor) {
+    cascadeRemoveInterceptor()
+    cascadeRemoveInterceptor = null
+  }
+})
 
 /** 选项直选 */
 function pickCascade(opt) {
@@ -434,7 +465,7 @@ function cancelClear() {
     </div>
 
     <div class="about">
-      <div class="about-line">BiliTV-Web v0.2.0</div>
+      <div class="about-line">{{ appVersion }}</div>
       <div class="about-line dim">
         基于 B 站 Web 公开接口 · 数据来源 bilibili.com · 登录凭据仅保存在本机
       </div>

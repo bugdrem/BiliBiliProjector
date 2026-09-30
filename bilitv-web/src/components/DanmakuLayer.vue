@@ -183,13 +183,40 @@ function isIdle() {
   return props.videoEl ? props.videoEl.paused : true
 }
 
+/**
+ * P9.44 长播功耗/性能：原先 rAF **永不停止**——暂停、切后台、弹幕关闭时仍在 60fps 空转
+ * （每帧一次 requestAnimationFrame 回调，投影仪上一夜能白烧掉大量 CPU 周期）。
+ * 现在空闲时取消 rAF 循环，恢复播放/回到前台再重启。
+ */
+function stopLoop() {
+  if (rafId) {
+    cancelAnimationFrame(rafId)
+    rafId = 0
+  }
+}
+
+function startLoop() {
+  if (rafId) return
+  rafId = requestAnimationFrame(frame)
+}
+
+/** 同屏滚动弹幕上限（docs/01 §6.3：≤30 条，防止密集合集把老设备压垮） */
+const MAX_ACTIVE = 30
+
 /** 每帧渲染 */
 function frame(ts) {
-  rafId = requestAnimationFrame(frame)
   const cvs = canvasRef.value
   const ctx = ctxRef.value
-  if (!cvs || !ctx || !props.enabled) return
-  if (isIdle()) return // 暂停/隐藏：保留当前帧不重绘
+  if (!cvs || !ctx || !props.enabled) {
+    // 弹幕关闭或无画布：停止循环，避免空转
+    stopLoop()
+    return
+  }
+  if (isIdle()) {
+    stopLoop() // 保留当前帧，停止调度
+    return
+  }
+  rafId = requestAnimationFrame(frame)
 
   // 尺寸校验：每 64 帧一次（约 1 秒），替代每帧 getBoundingClientRect
   if ((rafId & 63) === 0) fitCanvas()
@@ -215,6 +242,9 @@ function frame(ts) {
     // 密度控制：按档位概率保留（全量=1 时不过滤，避免随机数开销）
     if (props.density < 1 && Math.random() > props.density) continue
     if (c.mode === 'scroll') {
+      // P9.44：同屏上限保护——密度=全量时某些热门视频会同时挂数百条，
+      // 每帧 measureText + 描边/填充双绘，Z7X 直接掉帧
+      if (activeScroll.length >= MAX_ACTIVE) continue
       const fontSize = 22 * c.size * props.fontSizeScale
       ctx.font = `bold ${fontSize}px sans-serif`
       const tw = ctx.measureText(c.text).width
@@ -295,17 +325,37 @@ function onWinResize() {
   fitCanvas()
 }
 
+/** P9.44：回到前台/重新播放时重启渲染循环（空闲时循环已被 stopLoop 摘掉） */
+function kick() {
+  fitCanvas()
+  if (props.enabled && !isIdle()) startLoop()
+}
+
+function onVisibility() {
+  if (document.hidden) stopLoop()
+  else kick()
+}
+
 onMounted(() => {
   ctxRef.value = canvasRef.value ? canvasRef.value.getContext('2d') : null
   fitCanvas()
-  rafId = requestAnimationFrame(frame)
+  startLoop()
   window.addEventListener('resize', onWinResize)
+  document.addEventListener('visibilitychange', onVisibility)
   if (props.cid) load(props.cid)
 })
 
+// 播放状态回升（暂停→播放）时重启循环；暂停由 frame() 内的 stopLoop 处理
+watch(
+  () => [props.nativeMode, props.nativePlaying, props.enabled],
+  () => kick()
+)
+
 onUnmounted(() => {
-  cancelAnimationFrame(rafId)
+  stopLoop()
   window.removeEventListener('resize', onWinResize)
+  document.removeEventListener('visibilitychange', onVisibility)
+  comments = [] // P9.44：释放弹幕池（长播切多集时的大数组）
 })
 
 defineExpose({ seekTo })

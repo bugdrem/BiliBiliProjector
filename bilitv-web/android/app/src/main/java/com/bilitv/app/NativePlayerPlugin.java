@@ -49,9 +49,16 @@ public class NativePlayerPlugin extends Plugin {
 
     private ExoPlayer player;
     private TextureView textureView;
+    /** P9.44：Surface 单例复用+显式释放（原先每次 load 匿名 new Surface 从不 release，
+     *  长时间连播/切清晰度会不断泄漏 BufferQueue，最终硬解 IllegalStateException） */
+    private android.view.Surface videoSurface;
     private String decoderMode = "hw"; // hw=硬件解码（默认） / sw=软解码
     private boolean surfaceReady = false;
     private boolean pendingStart = false;
+    /** P9.44：最后一次有效播放进度（ms）——异常/IDLE 时避免把 0 写进用户历史 */
+    private long lastKnownPos = 0;
+    /** P9.44：同一 media 上 IO 自愈重试计数 */
+    private int ioRetryCount = 0;
 
     // 视频帧几何（P9.30 D46）：用于在占位区内等比缩放居中（修复拉伸变形）
     private int tgtX, tgtY, tgtW, tgtH; // 占位区（设备 px）
@@ -72,17 +79,36 @@ public class NativePlayerPlugin extends Plugin {
      * 自查全系统编解码器后按 MediaCodecInfo.hardwareAccelerated/softwareOnly 过滤；
      * 目标类别为空时回退系统默认顺序，保证可播）
      */
+    /**
+     * 按模式构造解码器选择器（真实 API：接口方法为 getDecoderInfos(mimeType, secure, tunneling)，
+     * 自查全系统编解码器后按 MediaCodecInfo.hardwareAccelerated/softwareOnly 过滤；
+     * 目标类别为空时回退系统默认顺序，保证可播）
+     *
+     * P9.44 修正（解码器自愈）：原实现在 hw 模式**只**返回硬解候选，此时
+     * setEnableDecoderFallback(true) 形同虚设——fallback 只能在候选列表内依次重试，
+     * 硬解 init 失败没有第二个候选可退（Z7X 上表现为绿屏/起播失败且无法自愈）。
+     * 现在 hw 模式返回「硬解在前 + 软解追尾」，真正用上 retryWithCodecReconfiguration；
+     * sw 模式仍只给软解（目标就是绕开厂商硬解 bug）。
+     */
     private MediaCodecSelector buildSelector() {
         final String mode = decoderMode;
         return (mimeType, requiresSecure, requiresTunneling) -> {
             List<MediaCodecInfo> infos =
                 MediaCodecSelector.DEFAULT.getDecoderInfos(mimeType, requiresSecure, requiresTunneling);
-            List<MediaCodecInfo> picked = new ArrayList<>();
+            List<MediaCodecInfo> hwList = new ArrayList<>();
+            List<MediaCodecInfo> swList = new ArrayList<>();
             for (MediaCodecInfo info : infos) {
-                if ("sw".equals(mode) && info.softwareOnly) picked.add(info);
-                if ("hw".equals(mode) && info.hardwareAccelerated) picked.add(info);
+                if (info.hardwareAccelerated) hwList.add(info);
+                if (info.softwareOnly) swList.add(info);
             }
-            return picked.isEmpty() ? infos : picked;
+            if ("sw".equals(mode)) return swList.isEmpty() ? infos : swList;
+            if ("hw".equals(mode)) {
+                if (hwList.isEmpty()) return swList.isEmpty() ? infos : swList;
+                List<MediaCodecInfo> picked = new ArrayList<>(hwList);
+                picked.addAll(swList); // 硬解失败 → 自动退到软解
+                return picked;
+            }
+            return infos;
         };
     }
 
@@ -98,25 +124,42 @@ public class NativePlayerPlugin extends Plugin {
         DefaultRenderersFactory renderersFactory = new DefaultRenderersFactory(getContext())
             .setMediaCodecSelector(buildSelector())
             .setEnableDecoderFallback(true)
-            .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON);
+            // P9.44：工程未打包任何 media3-*-decoder 扩展制品，ON 会让每次 load 都对 6+ 个
+            // 扩展类做反射 Class.forName 并吞 ClassNotFoundException（切一次清晰度重复一轮），
+            // 且 ON 的语义是"扩展优先于平台解码器"——将来误加软解扩展会压过硬解。
+            // 无扩展依赖时 OFF 行为等价且零反射开销。
+            .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_OFF);
+        // P9.44 内存与卡顿权衡：原先 min 30s/max 60s + prioritizeTimeOverSizeThresholds(true)
+        // 取消了 DefaultAllocator 的字节上限，长时间连播会持续吃内存/带宽，与 WebView 弹幕层抢资源。
+        // 改为 15s/30s + 5s 重缓冲，保留回看缓冲（遥控器回拖），并恢复字节上限。
         DefaultLoadControl loadControl = new DefaultLoadControl.Builder()
-            .setBufferDurationsMs(30000, 60000, 2500, 5000)
-            .setPrioritizeTimeOverSizeThresholds(true)
+            .setBufferDurationsMs(15000, 30000, 2500, 5000)
+            .setBackBuffer(30000, true)
             .build();
         return new ExoPlayer.Builder(getContext(), renderersFactory)
             .setLoadControl(loadControl)
             .setMediaSourceFactory(new DefaultMediaSourceFactory(httpFactory))
+            // P9.44：音频焦点 + 耳机/蓝牙断连自动暂停（ExoPlayer.Builder 默认两项均为 false，
+            // 投影外接音响抢占或断蓝牙时不会暂停，TV 场景必须显式打开）
+            .setAudioAttributes(
+                new androidx.media3.common.AudioAttributes.Builder()
+                    .setUsage(androidx.media3.common.C.USAGE_MEDIA)
+                    .setContentType(androidx.media3.common.C.AUDIO_CONTENT_TYPE_MOVIE)
+                    .build(),
+                true)
+            .setHandleAudioBecomingNoisy(true)
             .build();
     }
 
-    /** TextureView 就绪后把 Surface 交给播放器 */
+    /** TextureView 就绪后把 Surface 交给播放器（P9.44：Surface 单例复用 + 销毁时释放） */
     private final TextureView.SurfaceTextureListener surfaceListener =
         new TextureView.SurfaceTextureListener() {
             @Override
             public void onSurfaceTextureAvailable(android.graphics.SurfaceTexture surface, int w, int h) {
+                if (videoSurface == null) videoSurface = new Surface(surface);
                 surfaceReady = true;
                 if (player != null) {
-                    player.setVideoSurface(new Surface(surface));
+                    player.setVideoSurface(videoSurface);
                     if (pendingStart) {
                         pendingStart = false;
                         player.prepare();
@@ -130,6 +173,11 @@ public class NativePlayerPlugin extends Plugin {
 
             @Override
             public boolean onSurfaceTextureDestroyed(android.graphics.SurfaceTexture surface) {
+                // P9.44：TextureView 销毁会带着 SurfaceTexture 一起走，必须先把 Surface 从播放器
+                // 上摘下再 release，否则遗留的 MediaCodec 仍在写废弃队列（典型崩溃：
+                // IllegalStateException "BufferQueue has been abandoned"）
+                android.util.Log.w("BiliTV", "surface DESTROYED");
+                releaseSurface();
                 return true;
             }
 
@@ -196,8 +244,19 @@ public class NativePlayerPlugin extends Plugin {
                         return true;
                     });
                     ViewGroup content = getActivity().findViewById(android.R.id.content);
-                    // index 0 = 插到所有子视图最前（FrameLayout 后加者在上层）→ 渲染层沉底
-                    content.addView(textureView, 0);
+                    // index 0 = 插到所有子视图最前（FrameLayout 后加者在上层）→ 渲染层沉底。
+                    // P9.44 教训：曾尝试先以 1×1 加入防首帧全屏拉伸，但模拟器上 1×1 的
+                    // TextureView 不会创建 SurfaceTexture（onSurfaceTextureAvailable 不触发），
+                    // 结果音频在播、画面全黑。改为：有缓存矩形用矩形，否则 MATCH_PARENT。
+                    ViewGroup.LayoutParams initLp;
+                    if (tgtW > 0 && tgtH > 0) {
+                        initLp = new FrameLayout.LayoutParams(tgtW, tgtH);
+                    } else {
+                        initLp = new FrameLayout.LayoutParams(
+                            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT);
+                    }
+                    content.addView(textureView, 0, initLp);
+                    if (tgtW > 0 && tgtH > 0) applyVideoFrame();
                 }
                 // 每次原生播放都重新确认 WebView 置顶 + 透明（防止其它视图抢上层）
                 bringWebViewToFront(getActivity().findViewById(android.R.id.content));
@@ -240,21 +299,66 @@ public class NativePlayerPlugin extends Plugin {
 
                     @Override
                     public void onPlayerError(PlaybackException error) {
+                        if (player == null) return;
+                        final String msg = error.getMessage() == null ? "unknown" : error.getMessage();
+
+                        // P9.44：区分 IO 抖动与真正的解码/渲染失败。
+                        // 旧实现只上报一句话，PlayerView.handleNativeError 无法区分，
+                        // 一次弱网抖动就把 nativeFallbackUsed 永久置真 → 降级到 Z7X 上已知会崩的
+                        // WebView 内核。现在 TYPE_SOURCE(网络/数据源) 在原生层先自愈（最多 2 次，
+                        // 1s/3s 退避），解码/渲染类才上报给 JS 走「原生 hw → 原生 sw → WebView」。
+                        boolean isSourceError = false;
+                        String typeName = "unknown";
+                        if (error instanceof androidx.media3.exoplayer.ExoPlaybackException) {
+                            androidx.media3.exoplayer.ExoPlaybackException epe =
+                                (androidx.media3.exoplayer.ExoPlaybackException) error;
+                            isSourceError = epe.type == androidx.media3.exoplayer.ExoPlaybackException.TYPE_SOURCE;
+                            typeName = epe.type == androidx.media3.exoplayer.ExoPlaybackException.TYPE_SOURCE
+                                ? "source"
+                                : epe.type == androidx.media3.exoplayer.ExoPlaybackException.TYPE_RENDERER
+                                    ? "renderer"
+                                    : "unexpected";
+                        }
+
+                        if (isSourceError && ioRetryCount < 2) {
+                            ioRetryCount++;
+                            final long resume = lastKnownPos;
+                            final long delay = ioRetryCount == 1 ? 1000L : 3000L;
+                            new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(() -> {
+                                try {
+                                    if (player != null) {
+                                        player.seekTo(resume);
+                                        player.prepare();
+                                        player.setPlayWhenReady(true);
+                                    }
+                                } catch (Exception ignored) {
+                                    /* 自愈失败：下一次错误会上报到 JS */
+                                }
+                            }, delay);
+                            return;
+                        }
+
                         JSObject d = new JSObject();
-                        d.put("message", error.getMessage() == null ? "unknown" : error.getMessage());
+                        d.put("message", msg);
+                        d.put("errorCode", error.errorCode);
+                        d.put("type", typeName);
                         notifyListeners("error", d);
                     }
                 });
 
                 player.setMediaItem(MediaItem.fromUri(url));
                 if (startMs > 0) player.seekTo((long) startMs);
-                if (surfaceReady) {
-                    player.setVideoSurface(new Surface(textureView.getSurfaceTexture()));
+                if (videoSurface == null && textureView.getSurfaceTexture() != null) {
+                    videoSurface = new Surface(textureView.getSurfaceTexture());
+                }
+                if (videoSurface != null) {
+                    player.setVideoSurface(videoSurface);
                     player.prepare();
                     player.setPlayWhenReady(true);
                 } else {
                     pendingStart = true; // Surface 尚未就绪：onSurfaceTextureAvailable 接棒
                 }
+                ioRetryCount = 0; // 新的一次 load：重置 IO 自愈计数
                 call.resolve();
             } catch (Exception e) {
                 call.reject("load 失败: " + e.getMessage());
@@ -272,7 +376,16 @@ public class NativePlayerPlugin extends Plugin {
         final int h = (int) Math.round(call.getDouble("h", 1.0) * dpr);
         final boolean stretch = call.getBoolean("stretch", false);
         getActivity().runOnUiThread(() -> {
+            // P9.44：JS 常在 load() 之前就同步几何（nativePlayer.js / PlayerView 挂载时），
+            // 此时 textureView 还没建。原实现直接 resolve 丢弃矩形 → 新建的 TextureView
+            // 以 MATCH_PARENT 加入，首帧全屏拉伸，要等下一次同步才纠正。
+            // 这里先记下目标矩形，随后新建 TextureView 时会立即 applyVideoFrame()。
             if (textureView == null) {
+                tgtX = x;
+                tgtY = y;
+                tgtW = w;
+                tgtH = h;
+                stretchMode = stretch;
                 call.resolve();
                 return;
             }
@@ -325,12 +438,38 @@ public class NativePlayerPlugin extends Plugin {
      */
     private void bringWebViewToFront(ViewGroup content) {
         android.webkit.WebView wv = getBridge() != null ? getBridge().getWebView() : null;
-        if (content == null || wv == null) return;
-        if (wv.getParent() != content) content.addView(wv);
-        // 透明背景：WebView 自身不绘制底色，才能透出下层的 TextureView 画面
+        if (wv == null) return;
+        // P9.44 修复（阻塞级）：Capacitor 的 WebView 挂在 bridge layout 的 CoordinatorLayout 里，
+        // **不是** android.R.id.content 的直接子视图。原先 `if (wv.getParent() != content)
+        // content.addView(wv)` 恒真 → 对已有父视图的子视图 addView 抛
+        // IllegalStateException("The specified child already has a parent")，被 load() 的
+        // catch(Exception) 吞成 "load 失败"，整个原生起播被打断（只能落到 WebView/MSE 降级，
+        // 而 WebView 内核在 Z7X 上已知崩溃）。content.bringChildToFront(wv) 同理无效
+        // （indexOfChild 返回 -1，静默失败）。
+        // 正确做法：绝不重挂载 WebView；仅在它需要保序时在**它自己的父布局**内提到最前。
         wv.setBackgroundColor(android.graphics.Color.TRANSPARENT);
-        content.bringChildToFront(wv);
-        content.invalidate();
+        android.view.ViewParent parent = wv.getParent();
+        if (parent instanceof ViewGroup) {
+            ((ViewGroup) parent).bringChildToFront(wv);
+        }
+        wv.invalidate();
+    }
+
+    /**
+     * P9.44：把播放器当前的 Surface 解绑并释放（切清晰度/退后台/销毁前必调）。
+     * 不释放会让 MediaCodec 继续向已废弃的 BufferQueue 写帧 → 硬解崩溃/内存累积。
+     */
+    private void releaseSurface() {
+        if (player != null) {
+            try {
+                player.setVideoSurface(null);
+            } catch (Exception ignored) { /* 播放器已释放 */ }
+        }
+        if (videoSurface != null) {
+            videoSurface.release();
+            videoSurface = null;
+        }
+        surfaceReady = false;
     }
 
     /** 隐藏渲染层（离开原生播放时调用） */
@@ -399,7 +538,11 @@ public class NativePlayerPlugin extends Plugin {
         getActivity().runOnUiThread(() -> {
             JSObject d = new JSObject();
             if (player != null) {
-                d.put("position", player.getCurrentPosition());
+                long pos = player.getCurrentPosition();
+                // P9.44：出错/IDLE 时 getCurrentPosition() 会返回 0，JS 侧会把 0 写进观看历史
+                // （表现为"从来没看过进度"）。这里保留最后一次有效进度兜底。
+                if (pos > 0) lastKnownPos = pos;
+                d.put("position", pos > 0 ? pos : lastKnownPos);
                 d.put("duration", player.getDuration());
                 d.put("playing", player.isPlaying());
             } else {
@@ -469,12 +612,23 @@ public class NativePlayerPlugin extends Plugin {
     }
 
     /** 内部复位：销毁播放器、摘除渲染层（load/release 双入口复用） */
+    /**
+     * 复位播放器（切清晰度/分P/退出播放都会走）
+     *
+     * P9.44 长播内存修复：原实现每次都把 TextureView 从视图树 remove 并置 null，
+     * 于是「多集连播 = 反复新建 TextureView + SurfaceTexture + 匿名 Surface，且旧 Surface
+     * 从不 release」，是长时间观看内存持续增长与硬解崩溃的主要来源。
+     * 现在 TextureView 常驻复用（仅 GONE），Surface 走 releaseSurface() 显式释放；
+     * 彻底销毁只在 handleOnDestroy 做。
+     */
     private void releaseInternal() {
         rendering = false; // P9.29 D45：触摸拦截随渲染层一起摘除
         videoW = 0;
         videoH = 0;
         videoSar = 1f;
         videoRot = 0;
+        // 顺序：先摘/释放 Surface，再 stop/release，避免 MediaCodec 继续写废弃队列
+        releaseSurface();
         if (player != null) {
             try {
                 player.stop();
@@ -484,16 +638,50 @@ public class NativePlayerPlugin extends Plugin {
             player = null;
         }
         if (textureView != null) {
-            ViewGroup parent = (ViewGroup) textureView.getParent();
-            if (parent != null) parent.removeView(textureView);
-            textureView = null;
+            textureView.setVisibility(View.GONE); // 复用，不 remove（保持 index 0 的层级）
         }
-        surfaceReady = false;
         pendingStart = false;
+        ioRetryCount = 0;
+    }
+
+    /** P9.44：退后台/息屏时停止解码并释放 Surface（ExoPlayer 默认会在后台继续解码） */
+    @Override
+    protected void handleOnPause() {
+        if (player != null) {
+            try {
+                lastKnownPos = player.getCurrentPosition();
+                player.pause();
+                releaseSurface();
+            } catch (Exception ignored) { /* 播放器已释放 */ }
+        }
+    }
+
+    /** P9.44：回到前台恢复画面 */
+    @Override
+    protected void handleOnResume() {
+        rendering = false; // 桥重建场景：抹掉可能残留的静态标记
+        if (player == null || textureView == null) return;
+        try {
+            if (textureView.getSurfaceTexture() != null && videoSurface == null) {
+                videoSurface = new android.view.Surface(textureView.getSurfaceTexture());
+            }
+            if (videoSurface != null) {
+                surfaceReady = true;
+                player.setVideoSurface(videoSurface);
+                if (lastKnownPos > 0) player.seekTo(lastKnownPos);
+                player.setPlayWhenReady(true);
+            }
+        } catch (Exception ignored) { /* 下次 load 会重建 */ }
     }
 
     @Override
     protected void handleOnDestroy() {
         releaseInternal();
+        // 真正销毁时才从视图树摘除渲染层
+        if (textureView != null) {
+            android.view.ViewParent parent = textureView.getParent();
+            if (parent instanceof ViewGroup) ((ViewGroup) parent).removeView(textureView);
+            textureView = null;
+        }
     }
 }

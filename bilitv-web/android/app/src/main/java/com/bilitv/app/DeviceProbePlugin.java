@@ -30,6 +30,35 @@ public class DeviceProbePlugin extends Plugin {
     /** 每次内层循环计的“操作数”（3 次 xorshift + 1 次 add ≈ 8 计） */
     private static final int OPS_PER_ITER = 8;
 
+    /**
+     * 应用版本信息（P9.44）：设置页底栏展示 `BiliTV-v1.3.21-release` 这类字串。
+     * versionName/versionCode 从 PackageManager 取，buildType 用 AGP 生成的
+     * BuildConfig.BUILD_TYPE（debug / release），便于一眼分辨装的是哪个包。
+     */
+    @PluginMethod
+    public void getAppVersion(PluginCall call) {
+        JSObject d = new JSObject();
+        d.put("versionName", "");
+        d.put("versionCode", 0);
+        d.put("buildType", "web");
+        try {
+            android.content.pm.PackageInfo pi =
+                getContext().getPackageManager().getPackageInfo(getContext().getPackageName(), 0);
+            d.put("versionName", nz(pi.versionName));
+            d.put("versionCode", android.os.Build.VERSION.SDK_INT >= 28 ? pi.getLongVersionCode() : pi.versionCode);
+            // 不用 BuildConfig.BUILD_TYPE：AGP 8 起 buildFeatures.buildConfig 默认关闭，
+            // 直接引用会编译失败。改用 FLAG_DEBUGGABLE 判定（debug 包恒为 true），
+            // 语义与 buildType 一致且无需额外配置。
+            boolean debuggable =
+                (getContext().getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0;
+            d.put("buildType", debuggable ? "debug" : "release");
+            d.put("packageName", nz(pi.packageName));
+        } catch (Exception ignored) {
+            /* 取不到就留空，前端兜底 */
+        }
+        call.resolve(d);
+    }
+
     @PluginMethod
     public void getInfo(PluginCall call) {
         JSObject d = new JSObject();
