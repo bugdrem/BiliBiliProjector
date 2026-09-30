@@ -56,6 +56,9 @@ export const WEB_UA =
  * （ranking 无 Referer 直接 -352，P0 实测）。按最长前缀匹配，未命中给首页兜底。
  */
 const REFERER_RULES = [
+  // P9.45：动态流属于「动态站」域（t.bilibili.com），Referer 落在 www 会被 WAF 拒
+  // （表现为登录态下首页-关注一直「网络异常」，其余走 www 域的接口全部正常）
+  [/^\/x\/polymer\//, 'https://t.bilibili.com/'],
   [/^\/x\/web-interface\/ranking/, 'https://www.bilibili.com/v/popular/rank/all/'],
   [/^\/x\/web-interface\/popular\/series/, 'https://www.bilibili.com/v/popular/weekly'],
   [/^\/x\/web-interface\/popular\/precious/, 'https://www.bilibili.com/v/popular/history'],
@@ -108,11 +111,20 @@ async function transmit(url, method, headers, body, timeout, responseType = 'jso
       ...(body ? { data: body } : {}),
       responseType,
       connectTimeout: 10000,
-      readTimeout: timeout
+      // P9.45：readTimeout 下限 20s——动态 feed 等接口响应体可达数 MB，Z7X 一般网络
+      // 10s 读不完会被 OkHttp 掐断，表现同样是"网络异常"
+      readTimeout: Math.max(20000, timeout)
     })
     const status = res.status || 0
     if (status >= 500) throw new Error(`HTTP ${status}`)
-    return { status, data: responseType === 'text' ? res.data : res.data }
+    if (status >= 400) throw new Error(`HTTP ${status}`)
+    // P9.45：WAF 拦截返回的是 HTML 风控页而非 JSON，CapacitorHttp 在 responseType=json
+    // 下会解析失败并只抛一个泛化错误，前端只能显示"网络异常"。
+    // 这里显式给出状态码与响应片段，便于定位（此前关注动态流就栽在这里）。
+    if (responseType === 'json' && res.data == null) {
+      throw new Error(`HTTP ${status} 响应非 JSON`)
+    }
+    return { status, data: res.data }
   }
 
   const ctrl = new AbortController()
@@ -127,6 +139,7 @@ async function transmit(url, method, headers, body, timeout, responseType = 'jso
       ...(body ? { body } : {})
     })
     if (res.status >= 500) throw new Error(`HTTP ${res.status}`)
+    if (res.status >= 400) throw new Error(`HTTP ${res.status}`) // 与原生分支对称：WAF 拦截页不是 JSON
     return { status: res.status, data: responseType === 'text' ? await res.text() : await res.json() }
   } finally {
     clearTimeout(timer)
