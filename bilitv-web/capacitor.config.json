@@ -1,0 +1,17 @@
+{
+  "appId": "com.bilitv.app",
+  "appName": "BiliTV",
+  "webDir": "dist",
+  "androidScheme": "https",
+  "plugins": {
+    "CapacitorHttp": {
+      "enabled": true
+    },
+    "CapacitorCookies": {
+      "enabled": true
+    }
+  },
+  "android": {
+    "allowMixedContent": false
+  }
+}

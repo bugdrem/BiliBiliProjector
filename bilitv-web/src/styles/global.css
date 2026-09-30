@@ -1,0 +1,464 @@
+/* ==========================================================
+   BiliTV 全局样式：暗黑主题（对照 BBLL）
+   字号 ≥20px、热区 ≥60px，面向 1080p TV 远距离观看
+   ========================================================== */
+
+:root {
+  /* 主题色板 */
+  --bg: #121218;          /* 全局背景 */
+  --bg-panel: #0f0f14;    /* 侧边栏 / 深面板 */
+  --bg-card: #1c1c26;     /* 卡片 */
+  --bg-card-hover: #262633;
+  --text: #e8e8f0;        /* 主文字 */
+  --text-dim: #9a9aad;    /* 次要文字 */
+  --accent: #00a1d6;      /* B 站蓝（焦点/主操作） */
+  --accent-pink: #fb7299; /* B 站粉（辅助强调） */
+  --line: #2a2a38;        /* 分隔线 */
+
+  /* 布局 */
+  --sidebar-w: 200px;     /* 左侧导航宽度（BBLL 建议控制在 200 左右） */
+  --radius: 10px;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body {
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'MiSans', 'HarmonyOS Sans', 'Microsoft YaHei', 'PingFang SC', system-ui, sans-serif;
+  font-size: 22px; /* TV 基准字号 */
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+#app {
+  height: 100%;
+}
+
+img {
+  display: block;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+
+input {
+  font: inherit;
+  color: inherit;
+}
+
+/* 滚动条隐藏（TV 无鼠标），保留滚动能力 */
+::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
+/* ---------- 应用布局：左侧导航 + 右侧内容 ---------- */
+
+.app-layout {
+  display: flex;
+  height: 100%;
+}
+
+.content-area {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 28px 36px;
+  scroll-padding: 28px; /* scrollIntoView nearest 时保留边距 */
+}
+
+/* ---------- 焦点视觉反馈（遥控器核心体验） ----------
+ * P9.5 性能：box-shadow 大模糊 + 长动画在弱 GPU（投影/盒子）上是
+ * 焦点移动卡顿的主因之一——去掉阴影、缩短动画，缩放保留（合成层友好） */
+[data-focusable] {
+  transition: transform 120ms ease, border-color 120ms ease, background-color 120ms ease;
+  border: 3px solid transparent;
+  outline: none;
+}
+
+.tv-focused {
+  border-color: var(--accent) !important;
+  transform: scale(1.04);
+  z-index: 10;
+}
+
+/* ---------- 通用组件样式（跨页面复用） ---------- */
+
+/* 页面标题行 */
+.page-title {
+  font-size: 30px;
+  font-weight: 700;
+  margin-bottom: 24px;
+}
+
+/* ---------- 频道子菜单横排（P9.20：首页/热门共用） ----------
+ * 吸顶容器：二级+三级菜单包在 .menus-sticky 内，滚动卡片时菜单吸附不参与滚动 */
+.menus-sticky {
+  position: sticky;
+  top: -28px; /* 贴到 .content-area 滚动口最顶（含其 28px padding） */
+  z-index: 30;
+  background: var(--bg);
+  padding: 8px 2px 14px;
+  margin: -8px 0 18px;
+}
+
+.menu-row {
+  display: flex;
+  align-items: stretch;
+  gap: 12px;
+}
+
+.menu-row + .menu-row {
+  margin-top: 12px;
+}
+
+/* 菜单胶囊：圆角矩形，宽度随文字完整显示（不截断） */
+.menu-pill {
+  flex: 0 0 auto;
+  min-width: fit-content;
+  padding: 12px 28px;
+  border-radius: 999px;
+  background: var(--bg-card);
+  display: flex;
+  align-items: center;
+  font-size: 20px;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.menu-pill.active {
+  background: var(--accent);
+  color: #fff;
+}
+
+.menu-pill.dim {
+  opacity: 0.45;
+}
+
+/* 横向滚动轨道（菜单项多时） */
+.menu-scroll {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  gap: 12px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  padding: 2px 2px 4px;
+}
+
+/* UP 卡片基础（期数卡/头像卡共用，原 HomeView scoped 提升为全局） */
+.up-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 22px 14px;
+  background: var(--bg-card);
+  border-radius: var(--radius);
+}
+
+.up-card.small {
+  flex: 0 0 auto;
+  width: 132px;
+  padding: 14px 10px;
+  gap: 8px;
+}
+
+.up-card.small.active {
+  outline: 2px solid var(--accent);
+}
+
+.up-card.small.dim {
+  opacity: 0.45;
+}
+
+.up-card.small .up-face {
+  width: 64px;
+  height: 64px;
+}
+
+.up-face {
+  width: 84px;
+  height: 84px;
+  border-radius: 50%;
+  object-fit: cover;
+}
+
+.up-name {
+  font-size: 19px;
+  text-align: center;
+  display: -webkit-box;
+  -webkit-line-clamp: 1;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  max-width: 100%;
+}
+
+.all-face {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 30px;
+  color: var(--accent);
+  background: var(--bg-hover);
+}
+
+/* Tab 行 */
+.tab-row {
+  display: flex;
+  gap: 18px;
+  margin-bottom: 26px;
+}
+
+.tab-item {
+  padding: 12px 30px;
+  border-radius: 999px;
+  background: var(--bg-card);
+  color: var(--text-dim);
+  font-size: 24px;
+  min-height: 60px;
+  display: flex;
+  align-items: center;
+}
+
+.tab-item.active {
+  background: var(--accent);
+  color: #fff;
+}
+
+/* 卡片网格 */
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(288px, 1fr));
+  gap: 22px 20px;
+}
+
+/* 视频卡片（bbll 布局：封面内浮层统计/时长 → 标题 → UP主·日期） */
+.video-card {
+  background: var(--bg-card);
+  border-radius: var(--radius);
+  overflow: hidden;
+  padding-bottom: 10px;
+  /* P9.5 性能：视口外卡片跳过布局/渲染（老 WebView 不识别则忽略，无害） */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 320px;
+}
+
+.video-card .cover {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  background: #000;
+}
+
+.video-card .cover img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.video-card .dur {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  background: rgba(0, 0, 0, 0.72);
+  color: #fff;
+  font-size: 17px;
+  padding: 3px 9px;
+  border-radius: 6px;
+}
+
+/* 统计浮层（左下角，与时长角标同一行叠加在缩略图内）：
+ * P9.20 起用 bilibili web 同款小图标 + 数字，不再显示「播放/弹幕」文字 */
+.video-card .cover-stats {
+  position: absolute;
+  left: 10px;
+  bottom: 10px;
+  max-width: calc(100% - 110px); /* 不与右侧时长角标重叠 */
+  background: rgba(0, 0, 0, 0.6);
+  color: #fff;
+  font-size: 17px;
+  padding: 3px 9px;
+  border-radius: 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  box-sizing: border-box;
+}
+
+.video-card .cover-stats .stat {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* bilibili web 同款小图标（实心填充，随文字色） */
+.video-card .cover-stats .stat-icon {
+  width: 20px;
+  height: 20px;
+  fill: currentColor;
+  flex-shrink: 0;
+}
+
+/* 弹幕对话框内的留白线条：挖空效果（背景色描边） */
+.video-card .cover-stats .stat-icon .dm-line {
+  fill: none;
+  stroke: rgba(0, 0, 0, 0.6);
+  stroke-width: 1.8;
+  stroke-linecap: round;
+}
+
+.video-card .card-title {
+  font-size: 20px;
+  line-height: 1.4;
+  padding: 8px 14px 4px;
+  /* P9.5：单行省略（bbll 风格），配合 UP 主行压缩整体卡高 */
+  display: block;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.video-card .card-up {
+  padding: 0 14px;
+  font-size: 17px;
+  color: var(--text-dim);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.video-card .card-up .up {
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+
+.video-card .card-stats .dot,
+.video-card .card-up .dot {
+  opacity: 0.6;
+}
+
+/* 状态块：加载 / 错误 / 空 */
+.state-block {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 22px;
+  padding: 90px 0;
+  color: var(--text-dim);
+}
+
+.state-block .btn {
+  padding: 14px 44px;
+  border-radius: 10px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 23px;
+  min-height: 60px;
+  display: inline-flex;
+  align-items: center;
+}
+
+.spinner {
+  width: 44px;
+  height: 44px;
+  border: 4px solid var(--line);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.9s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* 模态遮罩与面板 */
+.modal-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.62);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.modal-panel {
+  background: var(--bg-card);
+  border: 2px solid var(--line);
+  border-radius: 14px;
+  padding: 30px 36px;
+  min-width: 420px;
+  max-width: 78vw;
+  max-height: 76vh;
+  overflow-y: auto;
+}
+
+.modal-title {
+  font-size: 26px;
+  font-weight: 700;
+  margin-bottom: 22px;
+}
+
+/* 通用列表行（设置页等） */
+.setting-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 30px;
+  background: var(--bg-card);
+  border-radius: var(--radius);
+  padding: 22px 28px;
+  margin-bottom: 18px;
+  min-height: 76px;
+}
+
+.switch-dot {
+  width: 62px;
+  height: 32px;
+  border-radius: 999px;
+  background: var(--line);
+  position: relative;
+  transition: background 180ms ease;
+}
+
+.switch-dot::after {
+  content: '';
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: #fff;
+  transition: left 180ms ease;
+}
+
+.switch-dot.on {
+  background: var(--accent);
+}
+
+.switch-dot.on::after {
+  left: 33px;
+}

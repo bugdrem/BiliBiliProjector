@@ -1,0 +1,14 @@
+{
+  "name": "BiliTV",
+  "packageId": "com.bilitv.app",
+  "version": "1.0.0",
+  "entry": "dist/index.html",
+  "orientation": "landscape",
+  "permissions": ["INTERNET", "ACCESS_NETWORK_STATE"],
+  "network": { "cleartext": false },
+  "webview": {
+    "backButton": "history",
+    "clearCacheOnStart": false
+  },
+  "splashScreen": { "backgroundColor": "#121218" }
+}

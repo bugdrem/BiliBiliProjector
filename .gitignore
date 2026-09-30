@@ -1,34 +1,38 @@
-# Gradle files
-.gradle/
-build/
+# ===== Node / 前端 =====
+node_modules/
+dist/
+*.tsbuildinfo
+npm-debug.log*
+yarn-error.log*
 
-# Local configuration file (sdk path, etc)
+# ===== 交付 APK（体积大，不入库）=====
+releases/
+apk/
+*.apk
+*.aab
+
+# ===== 本机工具链 / 环境 / 项目数据 =====
+.tools/
+.android/
+.workbuddy/
 local.properties
+*.iml
 
-# Log/OS Files
+# ===== 图标生成预览（脚本产物）=====
+assets/icon-preview/
+
+# ===== 日志 / IDE / 系统 =====
 *.log
-
-# Android Studio generated files and folders
+.idea/
+.DS_Store
 captures/
 .externalNativeBuild/
 .cxx/
-*.aab
-*.apk
-output-metadata.json
 
-# IntelliJ
-*.iml
-.idea/
-misc.xml
-deploymentTargetDropDown.xml
-render.experimental.xml
-
-# Keystore files
+# ===== 密钥 =====
 *.jks
 *.keystore
 
-# Google Services (e.g. APIs or Firebase)
-google-services.json
-
-# Android Profiling
-*.hprof
+# ===== 通用构建 / Gradle 产物 =====
+build/
+.gradle/
