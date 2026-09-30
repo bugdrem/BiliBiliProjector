@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 应用级配色（P9.41 D55 新增：原生播放层级翻转后窗口需要不透明底色） -->
+    <color name="bilitv_bg">#0A0D16</color>
+</resources>

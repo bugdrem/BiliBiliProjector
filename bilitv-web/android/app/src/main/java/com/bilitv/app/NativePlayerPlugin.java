@@ -170,7 +170,12 @@ public class NativePlayerPlugin extends Plugin {
             try {
                 releaseInternal(); // 复位旧实例
 
-                // 渲染层：挂在 content 顶层（WebView 之上）
+                // 渲染层：挂在 content 底层（WebView 之下）—— P9.41 D55 层级翻转
+                // 历史做法（≤P9.38）把 TextureView 加在顶层盖住 WebView，WebView 内的
+                // 弹幕 canvas / OSD / 控制条全部被视频遮住（v1.3.11 起的已知限制）。
+                // 现改为：TextureView 在下（只负责渲染视频画面），WebView 在上且背景透明，
+                // 页面在原生播放态把 body 与视频区背景置 transparent「挖洞」，
+                // 于是下层视频从洞里透出、上层 WebView 里的弹幕浮在视频之上（层级正确）。
                 if (textureView == null) {
                     textureView = new TextureView(getContext());
                     textureView.setSurfaceTextureListener(surfaceListener);
@@ -191,8 +196,11 @@ public class NativePlayerPlugin extends Plugin {
                         return true;
                     });
                     ViewGroup content = getActivity().findViewById(android.R.id.content);
-                    content.addView(textureView);
+                    // index 0 = 插到所有子视图最前（FrameLayout 后加者在上层）→ 渲染层沉底
+                    content.addView(textureView, 0);
                 }
+                // 每次原生播放都重新确认 WebView 置顶 + 透明（防止其它视图抢上层）
+                bringWebViewToFront(getActivity().findViewById(android.R.id.content));
                 textureView.setVisibility(View.VISIBLE);
                 surfaceReady = textureView.isAvailable();
                 rendering = true; // P9.29 D45：MainActivity 触摸拦截生效
@@ -307,6 +315,24 @@ public class NativePlayerPlugin extends Plugin {
         textureView.setLayoutParams(lp);
     }
 
+    /**
+     * P9.41 D55：把 Capacitor WebView 提到 content 顶层并设为透明背景。
+     * FrameLayout 中「后添加者在上层」，层级必须恒为：
+     *   android.R.id.content
+     *     └─ TextureView（底：只渲染视频画面）
+     *        └─ WebView（上：页面 UI + 弹幕 canvas，背景透明，视频区透出下层画面）
+     * 顺序一旦颠倒，弹幕就会被视频盖住（v1.3.11~v1.3.20 的已知限制）。
+     */
+    private void bringWebViewToFront(ViewGroup content) {
+        android.webkit.WebView wv = getBridge() != null ? getBridge().getWebView() : null;
+        if (content == null || wv == null) return;
+        if (wv.getParent() != content) content.addView(wv);
+        // 透明背景：WebView 自身不绘制底色，才能透出下层的 TextureView 画面
+        wv.setBackgroundColor(android.graphics.Color.TRANSPARENT);
+        content.bringChildToFront(wv);
+        content.invalidate();
+    }
+
     /** 隐藏渲染层（离开原生播放时调用） */
     @PluginMethod
     public void hide(PluginCall call) {
@@ -317,8 +343,9 @@ public class NativePlayerPlugin extends Plugin {
     }
 
     /**
-     * 渲染层调暗（P9.30 D46）：OSD/面板/进度 HUD 显示时把视频层降到半透明，
-     * 让 WebView 中的浮层可见（原生层盖在 WebView 之上，调暗即"透出"）。
+     * 渲染层调暗（P9.30 D46 Legacy / P9.41 D55 起失效）：OSD/面板/进度 HUD 显示时把
+     * 视频层降到半透明。该方案建立在「渲染层盖在 WebView 之上、浮层原本全被挡」的前提上；
+     * D55 翻转层级后 WebView 浮层与弹幕本就可见，JS 侧已不再调用，此处仅保留接口。
      * alpha 0~1：1 恢复不透明。
      */
     @PluginMethod

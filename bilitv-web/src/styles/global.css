@@ -41,6 +41,19 @@ body {
   height: 100%;
 }
 
+/* P9.41 D55 原生播放层级：渲染层（TextureView）改挂在 WebView 之下，页面必须「挖洞」
+   ——body 背景透明，原生视频画面才能从下层透出；WebView 里的弹幕 canvas 因此可见。
+   同时窗口背景（styles.xml 的 android:windowBackground）承担黑边/未覆盖区的底色。 */
+body.native-play {
+  background: transparent;
+}
+
+/* 原生播放态结束页/信息区：body 透明后必须自带底色，否则会透出下层定格画面 */
+body.native-play .video-info,
+body.native-play .side-column {
+  background: var(--bg);
+}
+
 img {
   display: block;
 }

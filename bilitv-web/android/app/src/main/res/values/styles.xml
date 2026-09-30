@@ -7,6 +7,9 @@
         <item name="colorPrimary">@color/colorPrimary</item>
         <item name="colorPrimaryDark">@color/colorPrimaryDark</item>
         <item name="colorAccent">@color/colorAccent</item>
+        <!-- P9.41 D55 层级翻转：原生播放时 WebView 页面背景透明（视频区挖洞透出下层
+             TextureView），窗口背景必须是不透明深色，否则黑边/未覆盖区会透出白色底。 -->
+        <item name="android:windowBackground">@color/bilitv_bg</item>
     </style>
 
     <style name="AppTheme.NoActionBar" parent="Theme.AppCompat.DayNight.NoActionBar">

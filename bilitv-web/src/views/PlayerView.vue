@@ -568,15 +568,23 @@ function syncNativeLayout() {
 /** 适应模式切换 / 布局稳定后重同步渲染层几何（老设备首测可能取到过渡态尺寸） */
 watch(() => settings.videoFit, () => nextTick(() => syncNativeLayout()))
 
-/** 原生层调暗联动（P9.30 D46）：OSD/面板/HUD/接下来播放/结束页任一可见时把视频层
- *  降到半透明——原生视频层盖在 WebView 之上，浮层原本全部被挡（Z7X 实测） */
+/** 原生播放态「挖洞」（P9.41 D55 层级翻转）：渲染层 TextureView 改挂在 WebView 之下，
+ *  页面 body 背景需转透明，视频画面才能从下层透出、WebView 里的弹幕浮在画面之上。
+ *  播完（ended）保留挖洞：定格画面继续透出；信息区自带 var(--bg) 底色，不会串画面。
+ *  离场（退出播放页 / 回落到 WebView 播放）必须摘掉，否则其它页面会透明露出窗口黑底。 */
 watch(
-  () => [nativeMode.value, osdVisible.value, panel.value, !!seekHud.value, nextVisible.value, ended.value],
-  ([nm, osd, p, hud, next, ed]) => {
-    if (!nm) return
-    nativeDim(osd || p || hud || next || ed ? 0.35 : 1)
+  () => nativeMode.value,
+  (on) => {
+    if (typeof document === 'undefined') return
+    if (on) document.body.classList.add('native-play')
+    else document.body.classList.remove('native-play')
   }
 )
+
+/** 兜底清理：组件卸载时移除挖洞 class（避免残留全局 body，影响首页等后续页面） */
+function releaseHole() {
+  if (typeof document !== 'undefined') document.body.classList.remove('native-play')
+}
 
 /** 打开模态面板（P9.30 D46）：统一挂 onClose——硬件返回键 back() 弹层时
  *  同步清 panel 状态，修复"返回只弹层、弹框一直在" */
@@ -1375,6 +1383,7 @@ onUnmounted(() => {
   window.removeEventListener('resize', onWinResize)
   window.removeEventListener('tvfocuschange', onNextFocus)
   clearTimeout(osdTimer)
+  releaseHole() // P9.41 D55：摘除原生播放「挖洞」，恢复其它页面的不透明背景
   delete window.__tvDebug
 })
 </script>
@@ -1842,11 +1851,26 @@ onUnmounted(() => {
   background: #000;
 }
 
-/* 原生渲染占位盒（D39）：TextureView 覆盖此区域，视频区保持黑底 */
+/* 原生渲染占位盒（D39 / D55 层级翻转）：TextureView 覆盖此区域。
+   D55 起渲染层沉到 WebView 之下，占位盒必须透明，视频画面才能透出来；
+   非原生（MSE/WebView 播放）路径下 video 元素自带黑底，不受影响。 */
 .native-video-box {
   width: 100%;
   height: 100%;
   background: #000;
+}
+
+/* 原生播放态「挖洞」：body 透明后视频区不能有任何底色，否则会盖住下层渲染画面。
+   play-full 时视频铺满整屏，信息区本就 display:none，这里补底色兜底结束页双栏。 */
+body.native-play .native-video-box,
+body.native-play .video-wrap,
+body.native-play .video-el {
+  background: transparent;
+}
+
+body.native-play .video-info,
+body.native-play .side-column {
+  background: var(--bg);
 }
 
 /* 「接下来播放」横向卡片流（P9.23）：视频底部覆盖层，←/→ 引擎横向导航卡片 */
