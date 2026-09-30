@@ -583,8 +583,29 @@ watch(
 
 /** 兜底清理：组件卸载时移除挖洞 class（避免残留全局 body，影响首页等后续页面） */
 function releaseHole() {
-  if (typeof document !== 'undefined') document.body.classList.remove('native-play')
+  if (typeof document === 'undefined') return
+  document.body.classList.remove('native-play')
+  document.body.classList.remove('play-fullscreen')
 }
+
+/** 全屏播放态（P9.42）：清零外层容器 padding，视频才能真正铺满屏幕（否则四周露灰边） */
+const fullscreen = computed(() => !ended.value && settings.videoFit !== 'window')
+watch(
+  () => fullscreen.value,
+  (on) => {
+    if (typeof document === 'undefined') return
+    document.body.classList.toggle('play-fullscreen', !!on)
+  },
+  { immediate: true }
+)
+
+/** 播完回到双栏后重同步渲染层几何：定格画面要跟着回到新的视频区位置 */
+watch(
+  () => ended.value,
+  (v) => {
+    if (v) nextTick(() => syncNativeLayout())
+  }
+)
 
 /** 打开模态面板（P9.30 D46）：统一挂 onClose——硬件返回键 back() 弹层时
  *  同步清 panel 状态，修复"返回只弹层、弹框一直在" */
@@ -1778,12 +1799,18 @@ onUnmounted(() => {
   gap: 0;
 }
 
+/* 全屏播放态（P9.42 修订）：脱离 flex 流贴死视口四边，
+   只写 height:100vh 会被外层 content-area 的 padding 挤出一圈页面底色 */
 .play-full .video-wrap {
-  width: 100%;
-  aspect-ratio: auto;
+  position: fixed;
+  inset: 0;
+  width: 100vw;
   height: 100vh;
   max-height: none;
+  aspect-ratio: auto;
   border-radius: 0;
+  overflow: hidden;
+  z-index: 1;
 }
 
 .play-full .video-info,

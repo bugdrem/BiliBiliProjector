@@ -54,6 +54,16 @@ body.native-play .side-column {
   background: var(--bg);
 }
 
+/* P9.42 全屏播放：外层容器（左侧导航内容区）自带 padding: 28px 36px，会把播放页
+   整体内缩，视频四周露出一圈页面底色（#121218 深灰），看着像"没全屏"。
+   全屏播放态必须清零内外边距，视频才真正铺满屏幕。 */
+body.play-fullscreen .app-layout,
+body.play-fullscreen .content-area {
+  padding: 0;
+  height: 100%;
+  overflow: hidden;
+}
+
 img {
   display: block;
 }
