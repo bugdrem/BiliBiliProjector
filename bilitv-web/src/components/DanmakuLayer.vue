@@ -394,7 +394,10 @@ defineExpose({ seekTo })
 <style scoped>
 .danmaku-canvas {
   position: absolute;
-  inset: 0;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;  /* P9.51: inset 在 Android 9 Chromium 69 无效 */
   width: 100%;
   height: 100%;
   pointer-events: none;

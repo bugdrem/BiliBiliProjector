@@ -73,7 +73,13 @@ export const settings = reactive({
   })(),
   /** 省资源模式（P9.48）：null=跟随设备画像自动 / true=强制开 / false=强制关。
    *  开启后弹幕降分辨率+降帧+降密度、进度轮询降频——2GB/4 核这类弱设备防卡死的兜底档 */
-  lowPerf: loadLS('bilitv.set.lowperf', null)
+  lowPerf: loadLS('bilitv.set.lowperf', null),
+  /** 渲染层类型（P9.50）：surface=SurfaceView（默认）/ texture=TextureView。
+   *  Z7X 上 SurfaceView 挖洞若被 ROM 特殊处理导致黑屏，切 texture 对照 */
+  renderType: loadLS('bilitv.set.rendertype', 'surface'),
+  /** 渲染诊断（P9.50）：true 时把 body 背景强制标红——播放黑屏时若视频区变红，
+   *  说明 WebView 不透明挡住了视频；仍黑则说明渲染层本身没显示 */
+  diagMark: loadLS('bilitv.set.diagmark', false)
 })
 
 watch(
@@ -99,6 +105,9 @@ watch(
     ls.setItem('bilitv.set.defaultqn', JSON.stringify(s.defaultQn))
     ls.setItem('bilitv.set.defaultcodec', JSON.stringify(s.defaultCodec))
     ls.setItem('bilitv.set.decoder', JSON.stringify(s.decoder))
+    ls.setItem('bilitv.set.lowperf', JSON.stringify(s.lowPerf))
+    ls.setItem('bilitv.set.rendertype', JSON.stringify(s.renderType))
+    ls.setItem('bilitv.set.diagmark', JSON.stringify(s.diagMark))
   }
 )
 

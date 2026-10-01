@@ -66,6 +66,12 @@ export default defineConfig({
   base: './',
   build: {
     target: 'es2018',
+    // P9.51 关键修复：CSS 压缩目标也必须锚定老 WebView！
+    // 不设 cssTarget 时 esbuild 按 esnext 压缩 CSS，会把 top/right/bottom/left
+    // 合并成 inset、生成新语法——Android 9（Chromium 69）全不认识，导致
+    // 全屏层（弹窗遮罩/OSD/弹幕层/扫码登录）全部定位失效（跑位/只有半个画面）。
+    // 之前手工替换 inset 的兼容修复全被构建器悄悄还原，就是这个原因。
+    cssTarget: 'chrome69',
     chunkSizeWarningLimit: 1024
   },
   server: {

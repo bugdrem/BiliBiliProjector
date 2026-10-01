@@ -424,7 +424,8 @@ onMounted(() => {
 
 .hist-cover {
   width: 216px;
-  aspect-ratio: 16 / 9;
+  /* P9.51：Android 9 无 aspect-ratio → 显式给 16:9 高度（216×121）作兜底 */
+  height: 121px;
   object-fit: cover;
   border-radius: 8px;
   flex-shrink: 0;

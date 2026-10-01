@@ -287,11 +287,28 @@ input {
 .video-card .cover {
   position: relative;
   width: 100%;
-  aspect-ratio: 16 / 9;
   background: #000;
+  /* P9.51：Android 9 无 aspect-ratio，用 padding-top 撑出 16:9（图片为 absolute 铺满） */
+  height: 0;
+  padding-top: 56.25%;
+}
+
+@supports (aspect-ratio: 16 / 9) {
+  .video-card .cover {
+    height: auto;
+    padding-top: 0;
+    aspect-ratio: 16 / 9;
+  }
 }
 
 .video-card .cover img {
+  /* P9.51：封面容器在旧 WebView 上靠 padding-top 撑高（content height = 0）。
+     absolute + 四边 + width/height 同时给会过约束，老 Chromium 的求解结果
+     是图片被推到 content 区之外（截图里"图片在下半"）。改为只锚 top/left，
+     尺寸 100% 相对 padding box —— 新旧环境都从容器顶部铺满 */
+  position: absolute;
+  top: 0;
+  left: 0;
   width: 100%;
   height: 100%;
   object-fit: cover;
@@ -422,7 +439,10 @@ input {
 /* 模态遮罩与面板 */
 .modal-mask {
   position: fixed;
-  inset: 0;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;  /* P9.51: inset 在 Android 9 Chromium 69 无效 */
   background: rgba(0, 0, 0, 0.62);
   display: flex;
   align-items: center;

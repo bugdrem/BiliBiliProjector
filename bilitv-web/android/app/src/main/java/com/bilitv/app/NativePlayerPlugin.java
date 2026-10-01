@@ -3,6 +3,7 @@ package com.bilitv.app;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
+import android.view.TextureView;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.FrameLayout;
@@ -57,6 +58,15 @@ public class NativePlayerPlugin extends Plugin {
      * Surface 由 SurfaceHolder 系统管理，**不可手动 release**，只做摘挂。
      */
     private SurfaceView surfaceView;
+    /** P9.50：可切换的第二渲染层——Z7X 上 SurfaceView 挖洞若被 ROM 特殊处理导致黑屏，
+     *  可切回 TextureView（普通视图合成，不依赖挖洞）对照测试 */
+    private TextureView textureView;
+    /** 渲染层类型：surface（默认）| texture（由 JS load 参数传入） */
+    private String renderType = "surface";
+    /** TextureView 自建 Surface（归本类 release；holder 的 surface 绝不可 release） */
+    private android.view.Surface textureSurface;
+    /** videoSurface 是否由本类创建（决定 releaseSurface 是否 release 它） */
+    private boolean surfaceOwned = false;
     /** P9.44：Surface 单例复用+显式释放（原先每次 load 匿名 new Surface 从不 release，
      *  长时间连播/切清晰度会不断泄漏 BufferQueue，最终硬解 IllegalStateException） */
     private android.view.Surface videoSurface;
@@ -195,6 +205,7 @@ public class NativePlayerPlugin extends Plugin {
         public void surfaceCreated(SurfaceHolder holder) {
             surfaceReady = true;
             videoSurface = holder.getSurface();
+            surfaceOwned = false; // holder 托管，绝不能 release
             if (player != null) {
                 player.setVideoSurface(videoSurface);
                 if (pendingStart) {
@@ -216,6 +227,77 @@ public class NativePlayerPlugin extends Plugin {
         }
     };
 
+    /** P9.50：TextureView 渲染路径的回调（Surface 自建自放，普通视图合成不依赖挖洞） */
+    private final TextureView.SurfaceTextureListener textureListener =
+        new TextureView.SurfaceTextureListener() {
+            @Override
+            public void onSurfaceTextureAvailable(android.graphics.SurfaceTexture st, int w, int h) {
+                textureSurface = new Surface(st);
+                videoSurface = textureSurface;
+                surfaceOwned = true;
+                surfaceReady = true;
+                if (player != null) {
+                    player.setVideoSurface(videoSurface);
+                    if (pendingStart) {
+                        pendingStart = false;
+                        player.prepare();
+                        player.setPlayWhenReady(true);
+                    }
+                }
+            }
+
+            @Override
+            public void onSurfaceTextureSizeChanged(android.graphics.SurfaceTexture st, int w, int h) {}
+
+            @Override
+            public boolean onSurfaceTextureDestroyed(android.graphics.SurfaceTexture st) {
+                android.util.Log.w("BiliTV", "texture DESTROYED");
+                releaseSurface();
+                return true;
+            }
+
+            @Override
+            public void onSurfaceTextureUpdated(android.graphics.SurfaceTexture st) {}
+        };
+
+    /** 原生播放前的 window 背景（用于退出播放时还原） */
+    private android.graphics.drawable.Drawable savedWindowBg = null;
+
+    /**
+     * P9.50 关键修复候选：把 Activity window 背景临时透明化。
+     * 背景：SurfaceView（zOrderOnTop=false）的内容在 window surface 之下，靠「挖洞」
+     * （transparent region）透出来；而 P9.41 为防 WebView 透明后露白底，给 window 设了
+     * **不透明**的 bilitv_bg——它铺满整个 window surface，会把这个洞堵死。
+     * 结果：解码器正常工作、零丢帧、内存充足，但画面永远是黑的（Z7X 现象完全一致，
+     * 此前误判为「SwiftShader 模拟器限制」的模拟器黑屏也可能同源）。
+     */
+    private void makeWindowTransparent() {
+        try {
+            android.view.Window w = getActivity().getWindow();
+            if (savedWindowBg == null) {
+                android.graphics.drawable.Drawable d = w.getDecorView().getBackground();
+                savedWindowBg = d;
+            }
+            w.setBackgroundDrawable(
+                new android.graphics.drawable.ColorDrawable(android.graphics.Color.TRANSPARENT));
+        } catch (Exception ignored) { /* 取不到 window 就跳过，不影响播放 */ }
+    }
+
+    /** 退出原生播放时还原 window 背景（避免非播放页露出下层） */
+    private void restoreWindowBackground() {
+        try {
+            if (savedWindowBg != null) {
+                getActivity().getWindow().setBackgroundDrawable(savedWindowBg);
+                savedWindowBg = null;
+            }
+        } catch (Exception ignored) { /* 忽略 */ }
+    }
+
+    /** 当前生效的渲染层视图（layout/visibility/alpha 等通用 View 操作用） */
+    private View activeRender() {
+        return "texture".equals(renderType) ? (View) textureView : (View) surfaceView;
+    }
+
     @PluginMethod
     public void load(PluginCall call) {
         String url = call.getString("url");
@@ -223,6 +305,8 @@ public class NativePlayerPlugin extends Plugin {
             call.reject("url 必填");
             return;
         }
+        // P9.50：渲染层类型（surface|texture），Z7X 上黑屏时切 texture 对照
+        renderType = "texture".equals(call.getString("render")) ? "texture" : "surface";
         decoderMode = "sw".equals(call.getString("decoder")) ? "sw" : "hw";
         final double startMs = call.getDouble("startMs", 0.0);
 
@@ -254,7 +338,33 @@ public class NativePlayerPlugin extends Plugin {
                 // GL 合成，老 GPU（Z7X 投影芯片）上驱动级崩溃风险高、每帧还有 GPU 拷贝；
                 // SurfaceView 由系统独立窗口合成、默认就在窗口层之下，与「视频在底、
                 // WebView 透明挖洞在上」的架构天然匹配，是老电视/投影最稳的渲染路径。
-                if (surfaceView == null) {
+                boolean useTexture = "texture".equals(renderType);
+                if (useTexture ? textureView == null : surfaceView == null) {
+                if (useTexture) {
+                    textureView = new TextureView(getContext());
+                    textureView.setSurfaceTextureListener(textureListener);
+                    textureView.setOpaque(false);
+                    textureView.setFocusable(false);
+                    textureView.setOnTouchListener((v, event) -> {
+                        android.webkit.WebView wv = getBridge() != null ? getBridge().getWebView() : null;
+                        if (wv == null || textureView == null) return false;
+                        android.view.MotionEvent fwd = android.view.MotionEvent.obtain(event);
+                        fwd.offsetLocation(textureView.getLeft(), textureView.getTop());
+                        wv.dispatchTouchEvent(fwd);
+                        fwd.recycle();
+                        return true;
+                    });
+                    ViewGroup contentT = getActivity().findViewById(android.R.id.content);
+                    ViewGroup.LayoutParams lpT;
+                    if (tgtW > 0 && tgtH > 0) {
+                        lpT = new FrameLayout.LayoutParams(tgtW, tgtH);
+                    } else {
+                        lpT = new FrameLayout.LayoutParams(
+                            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT);
+                    }
+                    contentT.addView(textureView, 0, lpT);
+                    if (tgtW > 0 && tgtH > 0) applyVideoFrame();
+                } else {
                     surfaceView = new SurfaceView(getContext());
                     surfaceView.getHolder().addCallback(surfaceCallback);
                     // P9.26 D42：渲染层纯展示——不响应焦点，避免抢遥控器按键
@@ -282,12 +392,18 @@ public class NativePlayerPlugin extends Plugin {
                     content.addView(surfaceView, 0, initLp);
                     if (tgtW > 0 && tgtH > 0) applyVideoFrame();
                 }
+                }
                 // 每次原生播放都重新确认 WebView 置顶 + 透明（防止其它视图抢上层）
                 bringWebViewToFront(getActivity().findViewById(android.R.id.content));
-                surfaceView.setVisibility(View.VISIBLE);
-                surfaceReady = surfaceView.getHolder().getSurface() != null
-                    && surfaceView.getHolder().getSurface().isValid();
+                View rv = activeRender();
+                rv.setVisibility(View.VISIBLE);
+                surfaceReady = "texture".equals(renderType)
+                    ? textureView != null && textureView.isAvailable()
+                    : surfaceView != null && surfaceView.getHolder().getSurface() != null
+                        && surfaceView.getHolder().getSurface().isValid();
                 rendering = true; // P9.29 D45：MainActivity 触摸拦截生效
+                // P9.50：渲染层若沉在 window 之下，window 的不透明背景会堵住挖洞 → 黑屏
+                if (!"texture".equals(renderType)) makeWindowTransparent();
 
                 player = buildPlayer(httpFactory);
 
@@ -403,9 +519,18 @@ public class NativePlayerPlugin extends Plugin {
 
                 player.setMediaItem(MediaItem.fromUri(url));
                 if (startMs > 0) player.seekTo((long) startMs);
-                if (videoSurface == null && surfaceView.getHolder().getSurface() != null
-                    && surfaceView.getHolder().getSurface().isValid()) {
-                    videoSurface = surfaceView.getHolder().getSurface();
+                if (videoSurface == null) {
+                    if ("texture".equals(renderType)) {
+                        if (textureView != null && textureView.isAvailable()) {
+                            textureSurface = new Surface(textureView.getSurfaceTexture());
+                            videoSurface = textureSurface;
+                            surfaceOwned = true;
+                        }
+                    } else if (surfaceView != null && surfaceView.getHolder().getSurface() != null
+                        && surfaceView.getHolder().getSurface().isValid()) {
+                        videoSurface = surfaceView.getHolder().getSurface();
+                        surfaceOwned = false;
+                    }
                 }
                 if (videoSurface != null) {
                     player.setVideoSurface(videoSurface);
@@ -436,7 +561,7 @@ public class NativePlayerPlugin extends Plugin {
             // 此时渲染层还没建。原实现直接 resolve 丢弃矩形 → 新建的渲染层
             // 以 MATCH_PARENT 加入，首帧全屏拉伸，要等下一次同步才纠正。
             // 这里先记下目标矩形，随后新建渲染层时会立即 applyVideoFrame()。
-            if (surfaceView == null) {
+            if (activeRender() == null) {
                 tgtX = x;
                 tgtY = y;
                 tgtW = w;
@@ -462,7 +587,7 @@ public class NativePlayerPlugin extends Plugin {
      *  - 未知帧尺寸：铺满占位区。须在 UI 线程调用。
      */
     private void applyVideoFrame() {
-        if (surfaceView == null) return;
+        if (activeRender() == null) return;
         int x = tgtX, y = tgtY, w = tgtW, h = tgtH;
         if (!stretchMode && videoW > 0 && videoH > 0 && tgtW > 0 && tgtH > 0) {
             double vw = videoW * videoSar;
@@ -481,7 +606,7 @@ public class NativePlayerPlugin extends Plugin {
         FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(Math.max(1, w), Math.max(1, h));
         lp.leftMargin = Math.max(0, x);
         lp.topMargin = Math.max(0, y);
-        surfaceView.setLayoutParams(lp);
+        activeRender().setLayoutParams(lp);
     }
 
     /**
@@ -521,10 +646,14 @@ public class NativePlayerPlugin extends Plugin {
                 player.setVideoSurface(null);
             } catch (Exception ignored) { /* 播放器已释放 */ }
         }
-        if (videoSurface != null) {
+        // P9.50 修复：只有自建 Surface（TextureView 路径）才能 release；
+        // SurfaceHolder 托管的 surface 被 release 后 isValid 永远 false，
+        // SurfaceView 从此黑屏（Z7X 上第二次 load 起黑屏的直接嫌疑）
+        if (videoSurface != null && surfaceOwned) {
             videoSurface.release();
-            videoSurface = null;
         }
+        videoSurface = null;
+        surfaceOwned = false;
         surfaceReady = false;
     }
 
@@ -532,7 +661,8 @@ public class NativePlayerPlugin extends Plugin {
     @PluginMethod
     public void hide(PluginCall call) {
         getActivity().runOnUiThread(() -> {
-            if (surfaceView != null) surfaceView.setVisibility(View.GONE);
+            View rv = activeRender();
+            if (rv != null) rv.setVisibility(View.GONE);
             call.resolve();
         });
     }
@@ -547,8 +677,9 @@ public class NativePlayerPlugin extends Plugin {
     public void dim(PluginCall call) {
         final float alpha = (float) (double) call.getDouble("alpha", 1.0);
         getActivity().runOnUiThread(() -> {
-            if (surfaceView != null) {
-                surfaceView.setAlpha(Math.max(0f, Math.min(1f, alpha)));
+            View rv = activeRender();
+            if (rv != null) {
+                rv.setAlpha(Math.max(0f, Math.min(1f, alpha)));
             }
             call.resolve();
         });
@@ -627,6 +758,7 @@ public class NativePlayerPlugin extends Plugin {
             d.put("videoW", videoW);
             d.put("videoH", videoH);
             d.put("stretchMode", stretchMode);
+            d.put("render", renderType);
             try {
                 android.app.ActivityManager am = (android.app.ActivityManager)
                     getContext().getSystemService(android.content.Context.ACTIVITY_SERVICE);
@@ -710,6 +842,7 @@ public class NativePlayerPlugin extends Plugin {
      */
     private void releaseInternal() {
         rendering = false; // P9.29 D45：触摸拦截随渲染层一起摘除
+        restoreWindowBackground(); // P9.50：退出原生播放还原 window 背景
         videoW = 0;
         videoH = 0;
         videoSar = 1f;
@@ -724,9 +857,8 @@ public class NativePlayerPlugin extends Plugin {
             }
             player = null;
         }
-        if (surfaceView != null) {
-            surfaceView.setVisibility(View.GONE); // 复用，不 remove（保持 index 0 的层级）
-        }
+        if (surfaceView != null) surfaceView.setVisibility(View.GONE);
+        if (textureView != null) textureView.setVisibility(View.GONE);
         pendingStart = false;
         ioRetryCount = 0;
     }
@@ -747,11 +879,14 @@ public class NativePlayerPlugin extends Plugin {
     @Override
     protected void handleOnResume() {
         rendering = false; // 桥重建场景：抹掉可能残留的静态标记
-        if (player == null || surfaceView == null) return;
+        if (player == null || activeRender() == null) return;
         try {
-            Surface s = surfaceView.getHolder().getSurface();
-            if (s != null && s.isValid() && videoSurface == null) {
-                videoSurface = s;
+            if (!"texture".equals(renderType)) {
+                Surface s = surfaceView.getHolder().getSurface();
+                if (s != null && s.isValid() && videoSurface == null) {
+                    videoSurface = s;
+                    surfaceOwned = false;
+                }
             }
             if (videoSurface != null) {
                 surfaceReady = true;
@@ -770,6 +905,11 @@ public class NativePlayerPlugin extends Plugin {
             android.view.ViewParent parent = surfaceView.getParent();
             if (parent instanceof ViewGroup) ((ViewGroup) parent).removeView(surfaceView);
             surfaceView = null;
+        }
+        if (textureView != null) {
+            android.view.ViewParent parent = textureView.getParent();
+            if (parent instanceof ViewGroup) ((ViewGroup) parent).removeView(textureView);
+            textureView = null;
         }
     }
 }

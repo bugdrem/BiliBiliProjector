@@ -55,6 +55,7 @@ export async function nativeLoad(opts) {
     url: opts.url,
     headers: opts.headers || biliHeaders(),
     decoder: opts.decoder || 'hw',
+    render: opts.render || 'surface',
     startMs: Math.round((opts.startSec || 0) * 1000)
   })
 }

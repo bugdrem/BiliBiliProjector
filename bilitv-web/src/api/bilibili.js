@@ -319,7 +319,9 @@ export async function getView(bvid) {
   // 单视频分 P 通常只有 1 个——合集存在时选集面板切换为合集分集模式
   let season = null
   if (data.ugc_season && Array.isArray(data.ugc_season.sections)) {
-    const eps = data.ugc_season.sections.flatMap((s) => s.episodes || [])
+    // P9.51：flatMap 是 ES2019 方法，Android 9（Chromium 69）没有 → 播放页直接抛异常；
+    // esbuild 只转语法不补方法，必须换成 concat 手写
+    const eps = data.ugc_season.sections.reduce((acc, s) => acc.concat(s.episodes || []), [])
     if (eps.length > 1) {
       season = {
         id: data.ugc_season.id,

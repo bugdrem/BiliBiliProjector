@@ -175,7 +175,10 @@ onUnmounted(() => {
 /* 扫码后/过期遮罩 */
 .qr-dim {
   position: absolute;
-  inset: 0;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;  /* P9.51: inset 在 Android 9 Chromium 69 无效 */
   background: rgba(255, 255, 255, 0.94);
   display: flex;
   flex-direction: column;

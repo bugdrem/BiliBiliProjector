@@ -34,6 +34,17 @@ function toggleLowPerf() {
   toast(lowPerfText.value, { duration: 2400 })
 }
 
+/** 渲染层切换（P9.50）：SurfaceView ↔ TextureView，下次进播放页生效 */
+function cycleRenderType() {
+  settings.renderType = settings.renderType === 'texture' ? 'surface' : 'texture'
+  toast(
+    settings.renderType === 'texture'
+      ? '渲染层：TextureView（下次进播放页生效）'
+      : '渲染层：SurfaceView（下次进播放页生效）',
+    { duration: 2400 }
+  )
+}
+
 /**
  * 底栏版本信息（P9.44）：形如 `BiliTV-v1.3.21-release`
  * 原底栏写死 "BiliTV-Web v0.2.0"（多版本前的残留），与实际交付包完全对不上，
@@ -453,6 +464,26 @@ function cancelClear() {
 
     <!-- 通用 -->
     <div class="group-title">通用</div>
+    <div
+      v-focusable
+      class="setting-row"
+      data-focus-key="set-rendertype"
+      @click="cycleRenderType"
+    >
+      <span>渲染层（黑屏时切换测试）</span>
+      <span class="value">{{ settings.renderType === 'texture' ? 'TextureView' : 'SurfaceView' }} ›</span>
+    </div>
+
+    <div
+      v-focusable
+      class="setting-row"
+      data-focus-key="set-diagmark"
+      @click="settings.diagMark = !settings.diagMark"
+    >
+      <span>诊断：背景标红（判断黑屏归属）</span>
+      <span class="value">{{ settings.diagMark ? '开' : '关' }} ›</span>
+    </div>
+
     <div
       v-focusable
       class="setting-row"
