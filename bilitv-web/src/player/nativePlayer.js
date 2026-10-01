@@ -108,6 +108,28 @@ export async function nativeGetProgress() {
   }
 }
 
+/**
+ * 播放性能快照（P9.49）：解码器/软硬解/丢帧/渲染帧/分辨率/可用内存
+ * 用于回答「某台设备为什么播不动」——先判定解码路径，再看合成与内存
+ */
+export async function nativeGetStats() {
+  try {
+    const s = await NativePlayer.getStats()
+    return {
+      decoder: s.decoder || '',
+      software: !!s.software,
+      dropped: Number(s.dropped) || 0,
+      rendered: Number(s.rendered) || 0,
+      videoW: Number(s.videoW) || 0,
+      videoH: Number(s.videoH) || 0,
+      availMemMB: Number(s.availMemMB) || 0,
+      lowMemory: !!s.lowMemory
+    }
+  } catch (_) {
+    return null
+  }
+}
+
 /** 离开原生播放：释放播放器并摘除渲染层 */
 export async function nativeRelease() {
   try {

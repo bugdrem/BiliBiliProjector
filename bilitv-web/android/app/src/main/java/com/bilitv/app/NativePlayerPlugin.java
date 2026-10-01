@@ -68,6 +68,14 @@ public class NativePlayerPlugin extends Plugin {
     /** P9.44：同一 media 上 IO 自愈重试计数 */
     private int ioRetryCount = 0;
 
+    /* ---------------- 性能探针（P9.49） ----------------
+     * Z7X 上「云视听能播 1080p、本程序卡死」这类问题必须靠数据定位：
+     * 到底是解码跟不上（软解 / 丢帧），还是渲染合成与内存被 WebView 吃掉。
+     */
+    private String lastDecoderName = "";
+    private long droppedFrames = 0;
+    private long renderedFrames = 0;
+
     // 视频帧几何（P9.30 D46）：用于在占位区内等比缩放居中（修复拉伸变形）
     private int tgtX, tgtY, tgtW, tgtH; // 占位区（设备 px）
     private int videoW = 0, videoH = 0; // 视频原始宽高
@@ -363,6 +371,36 @@ public class NativePlayerPlugin extends Plugin {
                     }
                 });
 
+                // P9.49 性能探针：记录真实使用的解码器名与丢帧/渲染帧数
+                droppedFrames = 0;
+                renderedFrames = 0;
+                lastDecoderName = "";
+                player.addAnalyticsListener(new androidx.media3.exoplayer.analytics.AnalyticsListener() {
+                    @Override
+                    public void onVideoDecoderInitialized(
+                        androidx.media3.exoplayer.analytics.AnalyticsListener.EventTime eventTime,
+                        String decoderName,
+                        long initializationDurationMs) {
+                        lastDecoderName = decoderName;
+                    }
+
+                    @Override
+                    public void onDroppedVideoFrames(
+                        androidx.media3.exoplayer.analytics.AnalyticsListener.EventTime eventTime,
+                        int droppedFrames_,
+                        long elapsedMs) {
+                        droppedFrames += droppedFrames_;
+                    }
+
+                    @Override
+                    public void onVideoFrameProcessingOffset(
+                        androidx.media3.exoplayer.analytics.AnalyticsListener.EventTime eventTime,
+                        long totalProcessingOffsetUs,
+                        int frameCount) {
+                        renderedFrames += frameCount;
+                    }
+                });
+
                 player.setMediaItem(MediaItem.fromUri(url));
                 if (startMs > 0) player.seekTo((long) startMs);
                 if (videoSurface == null && surfaceView.getHolder().getSurface() != null
@@ -567,6 +605,37 @@ public class NativePlayerPlugin extends Plugin {
                 d.put("position", 0);
                 d.put("duration", 0);
                 d.put("playing", false);
+            }
+            call.resolve(d);
+        });
+    }
+
+    /**
+     * 播放性能快照（P9.49）：解码器名 / 软硬解判定 / 丢帧·渲染帧 / 视频分辨率 / 可用内存。
+     * 用于回答「为什么这台设备播不动」——先看解码路径再看合成与内存。
+     */
+    @PluginMethod
+    public void getStats(PluginCall call) {
+        getActivity().runOnUiThread(() -> {
+            JSObject d = new JSObject();
+            d.put("decoder", lastDecoderName == null ? "" : lastDecoderName);
+            // 解码器名带 .google./c2.android./sw 等特征 → 软件解码
+            String dn = (lastDecoderName == null ? "" : lastDecoderName).toLowerCase();
+            d.put("software", dn.contains(".google.") || dn.contains("c2.android.") || dn.contains("sw") || dn.contains("omx.google"));
+            d.put("dropped", droppedFrames);
+            d.put("rendered", renderedFrames);
+            d.put("videoW", videoW);
+            d.put("videoH", videoH);
+            d.put("stretchMode", stretchMode);
+            try {
+                android.app.ActivityManager am = (android.app.ActivityManager)
+                    getContext().getSystemService(android.content.Context.ACTIVITY_SERVICE);
+                android.app.ActivityManager.MemoryInfo mi = new android.app.ActivityManager.MemoryInfo();
+                am.getMemoryInfo(mi);
+                d.put("availMemMB", Math.round(mi.availMem / 1024.0 / 1024.0));
+                d.put("lowMemory", mi.lowMemory);
+            } catch (Exception ignored) {
+                /* 内存信息取不到不影响其它字段 */
             }
             call.resolve(d);
         });

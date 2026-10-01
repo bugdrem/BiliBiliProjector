@@ -14,7 +14,7 @@ import { hasFav, favDeal, getDefaultFolderId, reportHistory, heartBeat } from '.
 import { MsePlayer } from '../player/msePlayer'
 import {
   nativePlayerAvailable, nativeLoad, nativeLayout, nativePlay, nativePause,
-  nativeSeekTo, nativeSetSpeed, nativeGetProgress, nativeRelease, nativeOn
+  nativeSeekTo, nativeSetSpeed, nativeGetProgress, nativeGetStats, nativeRelease, nativeOn
 } from '../player/nativePlayer'
 import { focusEngine } from '../core/focus'
 import { settings, histAdd, histGet, toggleFav, isFav, runtimeSession, markLive, isLowPerf } from '../stores/app'
@@ -643,6 +643,29 @@ function applyDecoder(v) {
 }
 
 /** 发布日期（视频信息面板用） */
+/**
+ * 性能快照文案（P9.49）：打开视频信息面板时取样一次。
+ * 例：「硬解 OMX.amlogic.avc.decoder · 1920×1080 · 丢帧 12/840 · 可用内存 610MB」
+ * 软解 + 高丢帧 = 解码跟不上；硬解 + 高丢帧 + 低内存 = 合成/UI 层拖垮（WebView 税负）
+ */
+const perf = ref(null)
+const perfText = computed(() => {
+  const s = perf.value
+  if (!s) return ''
+  const dec = s.decoder ? `${s.software ? '软解' : '硬解'} ${s.decoder}` : '解码器未就绪'
+  const res = s.videoW && s.videoH ? `${s.videoW}×${s.videoH}` : ''
+  const drop = `丢帧 ${s.dropped}/${s.rendered}`
+  const mem = s.availMemMB ? `可用内存 ${s.availMemMB}MB${s.lowMemory ? '（紧张）' : ''}` : ''
+  return [dec, res, drop, mem].filter(Boolean).join(' · ')
+})
+watch(
+  () => panel.value,
+  async (p) => {
+    if (p !== 'info' || !nativeMode.value) return
+    perf.value = await nativeGetStats()
+  }
+)
+
 const pubDateText = computed(() => {
   const pd = video.value && video.value.pubdate
   if (!pd) return ''
@@ -657,14 +680,28 @@ const pubDateText = computed(() => {
  * 原生内核进度轮询：驱动 timeupdate 语义（500ms；P9.48 省资源档降为 1s——
  * 每次回调都会触发 Vue 响应式更新与进度落库，弱设备上要减少主线程抖动）
  */
+/** 性能采样计数（P9.49）：每 10 次轮询（约 10s/20s）打一次日志，供 adb 直接取数 */
+let perfTick = 0
+
 function startNativePoll() {
   stopNativePoll()
+  perfTick = 0
   nativePollTimer = setInterval(async () => {
     try {
       const p = await nativeGetProgress()
       curTime.value = p.positionSec
       if (p.durationSec > 0) duration.value = p.durationSec
       playing.value = p.playing
+      // P9.49：性能快照同步打到 logcat（Z7X 上无需遥控器点面板即可取数）
+      if (perfTick++ % 10 === 0) {
+        const s = await nativeGetStats()
+        if (s) {
+          perf.value = s
+          console.warn(
+            `[BiliTV] perf: ${s.software ? '软解' : '硬解'} ${s.decoder || '-'} · ${s.videoW}×${s.videoH} · 丢帧 ${s.dropped}/${s.rendered} · 可用内存 ${s.availMemMB}MB${s.lowMemory ? '(紧张)' : ''}`
+          )
+        }
+      }
       // 每 5 秒存一次进度（与 WebView 路径 onTimeUpdate 同节奏）
       if (p.positionSec - lastHistSave > 5 || p.positionSec < lastHistSave) {
         lastHistSave = p.positionSec
@@ -1793,6 +1830,8 @@ onUnmounted(() => {
             {{ fmtCount(video.stat.view) }} 播放 · {{ fmtCount(video.stat.danmaku) }} 弹幕<template v-if="video.stat.like"> · {{ fmtCount(video.stat.like) }} 点赞</template>
           </div>
           <div class="info-line" v-if="video.pages && video.pages.length > 1">共 {{ video.pages.length }} 个分P</div>
+          <!-- P9.49 性能探针：判定「解码跟不上」还是「合成/内存被吃掉」 -->
+          <div class="info-line" v-if="perfText">播放状态：{{ perfText }}</div>
           <div class="info-line" v-if="video.season">合集：{{ video.season.title }}（共 {{ video.season.eps.length }} 集）</div>
           <div class="info-line desc" v-if="video.desc">简介：{{ video.desc }}</div>
         </div>
