@@ -254,12 +254,23 @@ async function loadMore() {
   }
 }
 
+/**
+ * P9.53：路由切回热门页（播放页返回 / 侧边栏切页）不得重跑首屏网络请求。
+ * booted 必须是模块级标记——组件会被整体卸载重建，放在组件内会被重置回 false。
+ */
+let booted = false
+
 function retry() {
+  booted = false // 重试必须真的重发请求
   switchHot(hotSub.value)
 }
 
 onMounted(() => {
-  switchHot(hotSub.value)
+  // 只有首次进入、或上次首屏被打断（仍在 loading）才拉流
+  if (!booted || state.value === 'loading') {
+    booted = true
+    switchHot(hotSub.value)
+  }
   window.addEventListener('tvfocuschange', onFocusChange)
 })
 onUnmounted(() => {

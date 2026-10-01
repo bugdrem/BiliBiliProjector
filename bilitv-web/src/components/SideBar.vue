@@ -4,7 +4,7 @@
  * 分区名 sidebar；右键经 data-zone-exit-right 切入内容区。
  * 当前路由项高亮；点击切换路由。
  */
-import { route, navigate } from '../router'
+import { route, navigate, requestRefresh } from '../router'
 
 /** 导航项配置（P9.11 D33：热门为一级菜单，位于首页下方） */
 const NAV_ITEMS = [
@@ -15,7 +15,16 @@ const NAV_ITEMS = [
   { key: 'settings', label: '设置', icon: 'gear' }
 ]
 
+/**
+ * P9.53：再按一次当前导航项 = 主动刷新当前页（hash 没变，navigate 不会触发
+ * hashchange，原实现是"按了没反应"）。返回键的语义始终是"回上级菜单"，
+ * 主动刷新只认这一条显式入口。
+ */
 function go(key) {
+  if (route.name === key) {
+    requestRefresh()
+    return
+  }
   navigate(key)
 }
 </script>

@@ -4,15 +4,22 @@
  * - 推荐：feed 分页（缓存先行 + 后台增量，D25）
  * - 关注：云端/本地收藏与历史分流（D17/D5/D6）
  * 热门频道已独立为 HotView（#/hot，左侧一级菜单）。
+ *
+ * P9.53 会话态与返回栈治理：
+ *  1. 列表/游标/菜单选中态全部落在 stores/homeFeed（模块级响应式）——组件被卸载
+ *     后重建（进播放页再返回、侧边栏来回切页）直接按原样渲染，**不重发网络请求**；
+ *     只有显式再按一次「推荐 / 关注 / 首页」导航项才 force 刷新。
+ *  2. 播放页内换视频一律走 replace（见 router.navigate），返回键直接回上级菜单。
  */
-import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
+import { ref, onMounted, onUnmounted, nextTick } from 'vue'
 import { getFeedRcmd, getFollowings, getUpArchives } from '../api/bilibili'
 import { getFollowDynFeed } from '../api/cloud'
 import { auth } from '../stores/auth'
 import { settings } from '../stores/app'
+import { homeFeed } from '../stores/homeFeed'
 import { loadCache, saveCache, mergeCards } from '../stores/cardCache'
 import { focusEngine } from '../core/focus'
-import { navigate } from '../router'
+import { navigate, onRefreshRequest } from '../router'
 import VideoCard from '../components/VideoCard.vue'
 import StateBlock from '../components/StateBlock.vue'
 import { toast, toastError } from '../utils/toast'
@@ -27,82 +34,134 @@ const HOME_SUBS = [
   { key: 'rcmd', label: '推荐' },
   { key: 'follow', label: '关注' }
 ]
-const homeSub = ref('rcmd')
-const list = ref([])
-const state = ref('loading') // loading | ok | error | empty
-const errMsg = ref('')
-const hasMore = ref(false)
-const rcmdKey = ref('') // 推荐流游标（空 = 没有更多）
+
+/** 加载翻页锁（非响应式，仅同步并发用） */
 const loadingMore = ref(false)
 
 /* ---------------- 关注 Tab 状态（D17/D5/D6） ---------------- */
-const ups = ref([])
-const followView = ref('main')
-const followMode = ref('all')
-const followLoading = ref(false)
 
-/** 切换二级菜单 */
-async function loadSub(sub) {
-  homeSub.value = sub
-  errMsg.value = ''
+/** 二次菜单切换：点同一个 tab = 主动刷新（P9.53） */
+function onSubClick(key) {
+  loadSub(key, homeFeed.sub === key)
+}
 
-  /* 推荐：缓存先行 + 后台增量 */
+/**
+ * 进入/切换二级菜单
+ * @param {'rcmd'|'follow'} sub
+ * @param {boolean} [force] true = 用户显式再按一次同一项，强制重新拉流
+ */
+async function loadSub(sub, force = false) {
+  homeFeed.sub = sub
+  homeFeed.errMsg = ''
+
+  /* 推荐 */
   if (sub === 'rcmd') {
-    state.value = 'loading'
-    const cache = loadCache('rcmd')
-    if (cache && cache.list.length) {
-      list.value = cache.list.slice(0, settings.maxCards)
-      rcmdKey.value = cache.cursor || ''
-      hasMore.value = !!rcmdKey.value && list.value.length < settings.maxCards
-      state.value = 'ok'
-      await nextTick()
-      focusFirst()
+    // P9.53：路由切回（visited=true）——内存快照/缓存直接渲染，零网络请求
+    if (!force && homeFeed.visited) {
+      restoreRcmdView()
+      return
     }
-    refreshRcmd() // fire-and-forget：后台增量
+    homeFeed.visited = true // 已发起过首屏：此后切回首页不再重拉
+    // 首次进入：缓存先行（D25），随后后台增量拉新，回来的是新数据而不是转圈
+    applyRcmdCache()
+    if (homeFeed.state !== 'ok') homeFeed.state = 'loading'
+    refreshRcmd() // fire-and-forget
     return
   }
 
   /* 关注 */
-  state.value = 'loading'
+  if (!force && homeFeed.visited && homeFeed.state !== 'loading') {
+    // P9.53：本次会话已加载过关注流，回到本页只复原视图
+    homeFeed.state = homeFeed.list.length ? 'ok' : 'empty'
+    await nextTick()
+    focusFirst()
+    return
+  }
+  homeFeed.visited = true
+  homeFeed.state = 'loading'
   try {
     if (!auth.loggedIn) {
-      state.value = 'ok'
-      followView.value = 'main'
-      followMode.value = 'all'
-      ups.value = []
-      list.value = []
+      homeFeed.state = 'ok'
+      homeFeed.followView = 'main'
+      homeFeed.followMode = 'all'
+      homeFeed.ups = []
+      homeFeed.list = []
+      homeFeed.followBooted = true
       await nextTick()
       focusFirst()
       return
     }
-    const res = await getFollowings(1, 60)
-    ups.value = res.list
-    followView.value = 'main'
-    followMode.value = 'all'
-    state.value = 'ok'
+    // UP 列表只在首次进入关注页时拉（登录态变化时会在 auth 变更处重置）
+    if (!homeFeed.upsBooted) {
+      const res = await getFollowings(1, 60)
+      homeFeed.ups = res.list
+      homeFeed.upsBooted = true
+    }
+    homeFeed.followView = 'main'
+    homeFeed.followMode = 'all'
+    homeFeed.state = 'ok'
     await nextTick()
     focusFirst()
-    if (res.list.length) loadAllFeed()
+    if (homeFeed.ups.length) loadAllFeed()
+    homeFeed.followBooted = true
   } catch (err) {
-    state.value = 'error'
-    errMsg.value = err.message || '加载失败'
+    homeFeed.state = 'error'
+    homeFeed.errMsg = err.message || '加载失败'
+    homeFeed.followBooted = true
+  }
+}
+
+/** 用本地缓存复原推荐列表；返回 true 表示已渲染 */
+function applyRcmdCache() {
+  const cache = loadCache('rcmd')
+  if (!cache || !cache.list.length) return false
+  homeFeed.rcmdKey = cache.cursor || ''
+  homeFeed.list = cache.list.slice(0, settings.maxCards)
+  homeFeed.hasMore = !!homeFeed.rcmdKey && homeFeed.list.length < settings.maxCards
+  homeFeed.state = 'ok'
+  nextTick(() => focusFirst())
+  return true
+}
+
+/** 路由切回收复原视图（纯渲染，不发请求）：内存快照空时退到缓存 */
+function restoreRcmdView() {
+  if (!homeFeed.list.length) applyRcmdCache()
+  homeFeed.state = homeFeed.list.length ? 'ok' : 'empty'
+  nextTick(() => focusFirst())
+}
+
+/**
+ * P9.53 探针：记录推荐流拉取次数，打进 logcat。
+ * 取证用途——「从播放页返回 / 侧边栏切页不应重拉推荐流」，验证时数这一行即可；
+ * 只有显式再按一次「推荐 / 首页」导航项才会出现 #2。
+ */
+function probeRcmd() {
+  homeFeed.fetches += 1
+  try {
+    window.__rcmdFetches = homeFeed.fetches
+    console.log('[BiliTV] rcmd fetch #' + homeFeed.fetches)
+  } catch (_) {
+    /* 老 WebView 无 console 也无所谓 */
   }
 }
 
 /** 推荐流后台增量（缓存先行时静默合并） */
 async function refreshRcmd() {
+  probeRcmd()
   try {
     const res = await getFeedRcmd('')
-    rcmdKey.value = res.continueKey
-    list.value = mergeCards(res.list, loadCache('rcmd')?.list || [])
-    hasMore.value = !!res.continueKey && list.value.length < settings.maxCards
-    saveCache('rcmd', { list: list.value.slice(0, settings.maxCards), cursor: rcmdKey.value })
-    state.value = list.value.length ? 'ok' : 'empty'
+    homeFeed.rcmdKey = res.continueKey
+    homeFeed.list = mergeCards(res.list, loadCache('rcmd')?.list || [])
+    homeFeed.hasMore = !!res.continueKey && homeFeed.list.length < settings.maxCards
+    saveCache('rcmd', { list: homeFeed.list.slice(0, settings.maxCards), cursor: homeFeed.rcmdKey })
+    homeFeed.state = homeFeed.list.length ? 'ok' : 'empty'
   } catch (err) {
-    if (!list.value.length) {
-      state.value = 'error'
-      errMsg.value = err.message || '加载失败'
+    if (!homeFeed.list.length) {
+      homeFeed.state = 'error'
+      homeFeed.errMsg = err.message || '加载失败'
     }
+  } finally {
+    homeFeed.rcmdBooted = true
   }
 }
 
@@ -119,14 +178,14 @@ function onFocusChange(e) {
   const el = e.detail
   if (!el.classList.contains('video-card')) return
   // 关注-全部：动态流 offset 翻页
-  if (homeSub.value === 'follow' && followMode.value === 'all' && followHasMore) {
+  if (homeFeed.sub === 'follow' && homeFeed.followMode === 'all' && homeFeed.followHasMore) {
     const cards = Array.from(el.parentElement.querySelectorAll('.video-card'))
     const idx = cards.indexOf(el)
     if (idx >= cards.length - 6) loadMoreDyn()
     return
   }
   // 推荐：feed 游标翻页
-  if (homeSub.value === 'rcmd' && hasMore.value) {
+  if (homeFeed.sub === 'rcmd' && homeFeed.hasMore) {
     const cards = Array.from(el.parentElement.querySelectorAll('.video-card'))
     const idx = cards.indexOf(el)
     if (idx >= cards.length - 6) loadMore()
@@ -135,21 +194,21 @@ function onFocusChange(e) {
 
 async function loadMore() {
   if (loadingMore.value) return
-  if (list.value.length >= settings.maxCards) {
-    hasMore.value = false
+  if (homeFeed.list.length >= settings.maxCards) {
+    homeFeed.hasMore = false
     return
   }
   loadingMore.value = true
   try {
-    if (!rcmdKey.value) {
-      hasMore.value = false
+    if (!homeFeed.rcmdKey) {
+      homeFeed.hasMore = false
       return
     }
-    const res = await getFeedRcmd(rcmdKey.value)
-    rcmdKey.value = res.continueKey
-    list.value = mergeCards(res.list, list.value)
-    hasMore.value = !!res.continueKey && list.value.length < settings.maxCards
-    saveCache('rcmd', { list: list.value.slice(0, settings.maxCards), cursor: rcmdKey.value })
+    const res = await getFeedRcmd(homeFeed.rcmdKey)
+    homeFeed.rcmdKey = res.continueKey
+    homeFeed.list = mergeCards(res.list, homeFeed.list)
+    homeFeed.hasMore = !!res.continueKey && homeFeed.list.length < settings.maxCards
+    saveCache('rcmd', { list: homeFeed.list.slice(0, settings.maxCards), cursor: homeFeed.rcmdKey })
   } catch (err) {
     toastError(err)
   } finally {
@@ -161,62 +220,56 @@ async function loadMore() {
  * 「全部」/「单 UP」均走动态视频流接口（1 个请求替代逐 UP searchAll，
  * <1 秒出内容、真实时间序、覆盖全部关注 UP）；offset 触底懒加载。 */
 
-/** 动态流分页游标与是否还有下一页 */
-let followOffset = ''
-let followHasMore = false
-
-/**
- * 「全部」：关注 UP 的最新视频动态流（缓存先行 + 后台增量）
- */
+/** 「全部」：关注 UP 的最新视频动态流（缓存先行 + 后台增量） */
 function loadAllFeed() {
   const cache = loadCache('followAll')
   if (cache && cache.list.length) {
-    list.value = cache.list
-    followOffset = cache.cursor || ''
-    followHasMore = cache.hasMore !== false
+    homeFeed.list = cache.list
+    homeFeed.followOffset = cache.cursor || ''
+    homeFeed.followHasMore = cache.hasMore !== false
     refreshAllFeed() // 后台静默刷新
   } else {
-    list.value = []
+    homeFeed.list = []
     refreshAllFeed() // 无缓存：前台转圈
   }
 }
 
 async function refreshAllFeed() {
-  followLoading.value = !list.value.length
+  homeFeed.followLoading = !homeFeed.list.length
   try {
     const res = await getFollowDynFeed(0, '')
-    list.value = mergeCards(res.list, loadCache('followAll')?.list || [])
-    followOffset = res.offset
-    followHasMore = res.hasMore
+    homeFeed.list = mergeCards(res.list, loadCache('followAll')?.list || [])
+    homeFeed.followOffset = res.offset
+    homeFeed.followHasMore = res.hasMore
     saveCache('followAll', {
-      list: list.value.slice(0, settings.maxCards),
-      cursor: followOffset,
-      hasMore: followHasMore
+      list: homeFeed.list.slice(0, settings.maxCards),
+      cursor: homeFeed.followOffset,
+      hasMore: homeFeed.followHasMore
     })
   } catch (err) {
-    if (!list.value.length) toastError(err) // 有缓存内容时静默保旧
+    if (!homeFeed.list.length) toastError(err) // 有缓存内容时静默保旧
   } finally {
-    followLoading.value = false
+    homeFeed.followLoading = false
   }
 }
 
 /** 焦点触底 → 动态流 offset 翻页（仅「全部」模式） */
 async function loadMoreDyn() {
-  if (loadingMore.value || !followHasMore || !followOffset) return
-  if (list.value.length >= settings.maxCards) {
-    followHasMore = false
+  if (loadingMore.value || !homeFeed.followHasMore || !homeFeed.followOffset) return
+  if (homeFeed.list.length >= settings.maxCards) {
+    homeFeed.followHasMore = false
     return
   }
   loadingMore.value = true
   try {
-    const res = await getFollowDynFeed(0, followOffset)
-    list.value = mergeCards(res.list, list.value)
-    followOffset = res.offset
-    followHasMore = res.hasMore
+    const res = await getFollowDynFeed(0, homeFeed.followOffset)
+    homeFeed.list = mergeCards(res.list, homeFeed.list)
+    homeFeed.followOffset = res.offset
+    homeFeed.followHasMore = res.hasMore
     saveCache('followAll', {
-      list: list.value.slice(0, settings.maxCards),
-      cursor: followOffset,
-      hasMore: followHasMore
+      list: homeFeed.list.slice(0, settings.maxCards),
+      cursor: homeFeed.followOffset,
+      hasMore: homeFeed.followHasMore
     })
   } catch (err) {
     toastError(err)
@@ -227,105 +280,122 @@ async function loadMoreDyn() {
 
 /** 点击「全部」 */
 function openAll() {
-  followMode.value = 'all'
+  homeFeed.followMode = 'all'
   loadAllFeed()
 }
 
 /** 点击 UP 主：该 UP 的最新视频动态（host_mid 筛选，按时间序；D25 缓存同模式） */
 function openUp(up) {
-  followMode.value = up
+  homeFeed.followMode = up
   const key = `follow-${up.mid}`
   const cache = loadCache(key)
   if (cache && cache.list.length) {
-    list.value = cache.list
+    homeFeed.list = cache.list
     refreshUpVideos(up, key)
   } else {
-    list.value = []
+    homeFeed.list = []
     refreshUpVideos(up, key)
   }
 }
 
 /* ---------------- UP 主直连模式（P9.32 D48：播放页 UP主按钮 → #/home/<mid>） ---------------- */
-const upDirect = ref(null) // { mid } 非关注 UP 也可看投稿
-
 function openUpDirect(mid) {
-  upDirect.value = { mid: Number(mid) }
-  homeSub.value = 'follow'
-  followView.value = 'main'
-  followMode.value = { mid: Number(mid) }
+  homeFeed.upDirect = { mid: Number(mid) }
+  homeFeed.sub = 'follow'
+  homeFeed.followView = 'main'
+  homeFeed.followMode = { mid: Number(mid) }
   // P9.36 D52：未登录也可见投稿——wbi space 接口匿名可用（仅复用关注 UI，不走关注业务）
   if (!auth.loggedIn) {
     loadUpArchivesDirect(Number(mid))
     return
   }
-  state.value = 'loading'
+  homeFeed.followBooted = true // 直连页不是"关注首屏"，走下面的直连加载
   refreshUpVideos({ mid: Number(mid) }, `follow-${mid}`)
 }
 
 /** 未登录直连：space 投稿列表（匿名 wbi 签名） */
 async function loadUpArchivesDirect(mid) {
-  state.value = 'loading'
-  followLoading.value = true
+  homeFeed.state = 'loading'
+  homeFeed.followLoading = true
   try {
     const res = await getUpArchives(mid)
-    list.value = res.list
-    state.value = 'ok'
+    homeFeed.list = res.list
+    homeFeed.state = 'ok'
   } catch (err) {
-    state.value = 'error'
-    errMsg.value = err.message || '加载失败'
+    homeFeed.state = 'error'
+    homeFeed.errMsg = err.message || '加载失败'
   } finally {
-    followLoading.value = false
+    homeFeed.followLoading = false
   }
 }
 
 function exitUpDirect() {
-  upDirect.value = null
+  homeFeed.upDirect = null
+  homeFeed.followMode = 'all' // 退出直连后回到关注「全部」，否则 UP 横排仍高亮上一个 UP
   loadSub('follow')
 }
 
 async function refreshUpVideos(up, cacheKey) {
-  followLoading.value = !list.value.length
+  homeFeed.followLoading = !homeFeed.list.length
   try {
     const res = await getFollowDynFeed(up.mid, '')
     const videos = res.list.slice(0, Math.min(30, settings.maxCards))
-    list.value = videos
-    followOffset = res.offset
-    followHasMore = res.hasMore
+    homeFeed.list = videos
+    homeFeed.followOffset = res.offset
+    homeFeed.followHasMore = res.hasMore
     saveCache(cacheKey, { list: videos })
-    state.value = 'ok' // P9.32 D48：直连模式 / UP 模式共用
+    homeFeed.state = 'ok' // P9.32 D48：直连模式 / UP 模式共用
   } catch (err) {
-    if (!list.value.length) {
-      state.value = 'error'
-      errMsg.value = err.message || '加载失败'
+    if (!homeFeed.list.length) {
+      homeFeed.state = 'error'
+      homeFeed.errMsg = err.message || '加载失败'
     } else {
       toastError(err)
     }
   } finally {
-    followLoading.value = false
+    homeFeed.followLoading = false
   }
 }
 
 /** 展开 / 收起 UP 主网格 */
 function toggleGrid() {
-  followView.value = followView.value === 'main' ? 'grid' : 'main'
+  homeFeed.followView = homeFeed.followView === 'main' ? 'grid' : 'main'
   nextTick(() => focusEngine.focusZone('content'))
 }
 
+/** 失败重试：强制重新拉流（P9.53：retry 必须真的发请求） */
 function retry() {
-  loadSub(homeSub.value)
+  loadSub(homeFeed.sub, true)
 }
 
+/** 侧边栏/导航项「再按一次」主动刷新（P9.53） */
+function onRefresh() {
+  loadSub(homeFeed.sub, true)
+}
+
+let removeRefresh = null
+
 onMounted(() => {
+  window.addEventListener('tvfocuschange', onFocusChange)
+  removeRefresh = onRefreshRequest(onRefresh)
+  // P9.53 追踪：证明"路由切回首页不重拉推荐流"——返回后这一行会再次出现，
+  // 但下面不会出新的 rcmd fetch #N（N 不变）。
+  console.log(
+    `[BiliTV] home mount visited=${homeFeed.visited} state=${homeFeed.state} fetches=${homeFeed.fetches}`
+  )
   // P9.32 D48：#/home/<mid> 直连该 UP 投稿流（播放页「UP主」按钮入口）
   if (props.bvid && /^\d+$/.test(String(props.bvid))) {
+    homeFeed.visited = true // 直连模式走单独加载路径，不再触发推荐首屏
     openUpDirect(props.bvid)
-  } else {
-    loadSub(homeSub.value)
+    return
   }
-  window.addEventListener('tvfocuschange', onFocusChange)
+  // P9.53：路由切回（播放页返回 / 侧边栏切页）——快照已在内存里，直接渲染，零网络请求。
+  // 只有"首次进入"或上次没拿到内容（loading/empty/error）才真正拉流。
+  if (!homeFeed.visited || homeFeed.state !== 'ok') loadSub(homeFeed.sub)
 })
 onUnmounted(() => {
   window.removeEventListener('tvfocuschange', onFocusChange)
+  if (removeRefresh) removeRefresh()
 })
 </script>
 
@@ -341,32 +411,32 @@ onUnmounted(() => {
           :key="s.key"
           v-focusable
           class="menu-pill"
-          :class="{ active: homeSub === s.key }"
-          :data-autofocus="homeSub === s.key ? '' : undefined"
-          @click="loadSub(s.key)"
+          :class="{ active: homeFeed.sub === s.key }"
+          :data-autofocus="homeFeed.sub === s.key ? '' : undefined"
+          @click="onSubClick(s.key)"
         >
           {{ s.label }}
         </div>
       </div>
 
       <!-- UP 直连模式（D48）：返回 + 标题行 -->
-      <div v-if="homeSub === 'follow' && upDirect" class="menu-row">
+      <div v-if="homeFeed.sub === 'follow' && homeFeed.upDirect" class="menu-row">
         <div class="menu-scroll">
           <div v-focusable class="up-card small" data-autofocus @click="exitUpDirect">
             <div class="up-face all-face">←</div>
             <div class="up-name">返回</div>
           </div>
         </div>
-        <div class="up-direct-name">UP 主（ID {{ upDirect.mid }}）的投稿</div>
+        <div class="up-direct-name">UP 主（ID {{ homeFeed.upDirect.mid }}）的投稿</div>
       </div>
 
       <!-- 关注：UP 横排（三级菜单，横向滚动 + 展开钮） -->
-      <div v-if="homeSub === 'follow' && auth.loggedIn && followView === 'main' && state === 'ok' && !upDirect" class="menu-row">
+      <div v-if="homeFeed.sub === 'follow' && auth.loggedIn && homeFeed.followView === 'main' && homeFeed.state === 'ok' && !homeFeed.upDirect" class="menu-row">
         <div class="menu-scroll">
           <div
             v-focusable
             class="up-card small"
-            :class="{ active: followMode === 'all' }"
+            :class="{ active: homeFeed.followMode === 'all' }"
             data-autofocus
             @click="openAll"
           >
@@ -374,11 +444,11 @@ onUnmounted(() => {
             <div class="up-name">全部</div>
           </div>
           <div
-            v-for="up in ups"
+            v-for="up in homeFeed.ups"
             :key="up.mid"
             v-focusable
             class="up-card small"
-            :class="{ active: followMode !== 'all' && followMode.mid === up.mid }"
+            :class="{ active: homeFeed.followMode !== 'all' && homeFeed.followMode.mid === up.mid }"
             @click="openUp(up)"
           >
             <img class="up-face" :src="up.face" :alt="up.name" loading="lazy" />
@@ -390,40 +460,40 @@ onUnmounted(() => {
     </div>
 
     <!-- 关注：未登录引导 -->
-    <div v-if="homeSub === 'follow' && !auth.loggedIn" class="login-guide">
+    <div v-if="homeFeed.sub === 'follow' && !auth.loggedIn" class="login-guide">
       <div class="guide-title">登录后查看我的关注</div>
       <div class="guide-sub">扫码登录与手机端同一账号</div>
       <button v-focusable class="tab-item primary" @click="navigate('mine')">去扫码登录</button>
     </div>
 
     <!-- 关注：加载失败（D48 补：直连模式未登录/接口失败也有可见反馈） -->
-    <template v-else-if="homeSub === 'follow' && state === 'error'">
-      <StateBlock state="error" :message="errMsg" @retry="retry" />
+    <template v-else-if="homeFeed.sub === 'follow' && homeFeed.state === 'error'">
+      <StateBlock state="error" :message="homeFeed.errMsg" @retry="retry" />
     </template>
 
     <!-- 关注 主视图：视频区（UP 横排已上移进吸顶容器） -->
-    <template v-else-if="homeSub === 'follow' && followView === 'main' && state === 'ok'">
-      <StateBlock v-if="followLoading" state="loading" />
-      <StateBlock v-else-if="!list.length" state="empty" />
+    <template v-else-if="homeFeed.sub === 'follow' && homeFeed.followView === 'main' && homeFeed.state === 'ok'">
+      <StateBlock v-if="homeFeed.followLoading" state="loading" />
+      <StateBlock v-else-if="!homeFeed.list.length" state="empty" />
       <div v-else class="card-grid">
-        <VideoCard v-for="item in list" :key="item.bvid" :item="item" />
+        <VideoCard v-for="item in homeFeed.list" :key="item.bvid" :item="item" />
       </div>
     </template>
 
     <!-- 关注：展开的 UP 主网格 -->
-    <template v-else-if="homeSub === 'follow' && followView === 'grid' && state === 'ok'">
+    <template v-else-if="homeFeed.sub === 'follow' && homeFeed.followView === 'grid' && homeFeed.state === 'ok'">
       <div class="up-bar">
         <button v-focusable class="tab-item" @click="toggleGrid">▴ 收起</button>
-        <span class="up-bar-name">共 {{ ups.length }} 位 UP 主</span>
+        <span class="up-bar-name">共 {{ homeFeed.ups.length }} 位 UP 主</span>
       </div>
       <div class="up-grid">
         <div
-          v-for="up in ups"
+          v-for="up in homeFeed.ups"
           :key="up.mid"
           v-focusable
           class="up-card"
           :data-focus-key="'up-' + up.mid"
-          @click="openUp(up); followView = 'main'"
+          @click="openUp(up); homeFeed.followView = 'main'"
         >
           <img class="up-face" :src="up.face" :alt="up.name" loading="lazy" />
           <div class="up-name">{{ up.name }}</div>
@@ -432,13 +502,13 @@ onUnmounted(() => {
     </template>
 
     <!-- 推荐：通用列表 -->
-    <template v-else-if="homeSub === 'rcmd'">
-      <StateBlock v-if="state === 'loading'" state="loading" />
-      <StateBlock v-else-if="state === 'error'" state="error" :message="errMsg" @retry="retry" />
-      <StateBlock v-else-if="state === 'empty'" state="empty" />
+    <template v-else-if="homeFeed.sub === 'rcmd'">
+      <StateBlock v-if="homeFeed.state === 'loading'" state="loading" />
+      <StateBlock v-else-if="homeFeed.state === 'error'" state="error" :message="homeFeed.errMsg" @retry="retry" />
+      <StateBlock v-else-if="homeFeed.state === 'empty'" state="empty" />
 
       <div v-else class="card-grid">
-        <VideoCard v-for="item in list" :key="item.bvid" :item="item" />
+        <VideoCard v-for="item in homeFeed.list" :key="item.bvid" :item="item" />
       </div>
     </template>
   </div>

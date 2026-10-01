@@ -23,9 +23,18 @@ import { fmtClock, fmtCount } from '../utils/format'
 import DanmakuLayer from '../components/DanmakuLayer.vue'
 import VideoCard from '../components/VideoCard.vue'
 import StateBlock from '../components/StateBlock.vue'
-import { navigate, playPath, routeBack } from '../router'
+import { navigate, playPath, routeBack, replacePath } from '../router'
 
 const props = defineProps({ bvid: { type: String, default: '' } })
+
+/**
+ * P9.53 返回栈治理：播放页内部的所有换视频跳转（自动连播、选集/合集、相关推荐、
+ * UP 投稿页）统一 replace——历史里始终只有一条播放记录，按返回键直接回上级菜单，
+ * 而不是"退到上一个视频、还是播放页"逐级回退。
+ */
+function gotoVideo(bvid) {
+  replacePath(playPath(bvid))
+}
 
 /* ---------------- 状态 ---------------- */
 const state = ref('loading')
@@ -380,6 +389,7 @@ async function pickNativeQuality(qn) {
     await nativeLoad({
       url: play.url,
       decoder: dec,
+      render: settings.renderType,
       startSec: at,
       rect: (() => {
         const box = document.querySelector('.native-video-box')
@@ -608,7 +618,7 @@ function gotoUp() {
     toast('暂无 UP 主信息')
     return
   }
-  navigate('home/' + mid)
+  replacePath('home/' + mid) // P9.53：由播放页跳投稿页，返回应回上级菜单而非回到播放页
 }
 
 /** 视频信息弹窗内 UP 行 → 关面板后跳投稿页 */
@@ -795,6 +805,7 @@ async function startNative(startAt = 0, dec = 'hw') {
   await nativeLoad({
     url: play.url,
     decoder: dec,
+    render: settings.renderType,
     startSec: startAt,
     rect: (() => {
       const box = document.querySelector('.native-video-box')
@@ -1060,6 +1071,17 @@ watch(
   { immediate: true }
 )
 
+watch(
+  () => settings.diagMark,
+  (on) => {
+    // P9.50 诊断：黑屏时把 body 背景强制标红——播放页视频区若变红 = WebView 不透明
+    // 挡住了渲染层；仍黑 = 渲染层自身没显示（挖洞/合成问题），两个假设一次分辨
+    if (typeof document === 'undefined') return
+    document.body.style.background = on ? '#ff0000' : ''
+  },
+  { immediate: true }
+)
+
 /** 播完回到双栏后重同步渲染层几何：定格画面要跟着回到新的视频区位置 */
 watch(
   () => ended.value,
@@ -1085,7 +1107,7 @@ function cancelCountdown() {
 function playNext() {
   cancelCountdown()
   const next = related.value[0]
-  if (next) navigate(playPath(next.bvid))
+  if (next) gotoVideo(next.bvid) // P9.53：连播不污染返回栈
 }
 
 function onEnded() {
@@ -1576,7 +1598,7 @@ onUnmounted(() => {
           <div v-if="nextVisible && related.length" class="next-strip" data-focus-zone="next">
             <div class="next-title">接下来播放</div>
             <div class="next-scroll">
-              <VideoCard v-for="item in related.slice(0, nextCount)" :key="item.bvid" :item="item" class="next-card" />
+              <VideoCard v-for="item in related.slice(0, nextCount)" :key="item.bvid" :item="item" class="next-card" replace />
             </div>
           </div>
 
@@ -1686,7 +1708,7 @@ onUnmounted(() => {
       <div class="side-column" v-if="ended && related.length">
         <div class="side-title">相关推荐</div>
         <div class="side-list">
-          <VideoCard v-for="item in related.slice(0, 20)" :key="item.bvid" :item="item" class="side-card" />
+          <VideoCard v-for="item in related.slice(0, 20)" :key="item.bvid" :item="item" class="side-card" replace />
         </div>
       </div>
     </div>
@@ -1705,7 +1727,7 @@ onUnmounted(() => {
               class="ep-item"
               :class="{ cur: ep.bvid === props.bvid }"
               :data-autofocus="ep.bvid === props.bvid ? '' : undefined"
-              @click="navigate(playPath(ep.bvid))"
+              @click="gotoVideo(ep.bvid)"
             >
               {{ i + 1 }}. {{ ep.title }}
             </div>
@@ -1905,7 +1927,10 @@ onUnmounted(() => {
    只写 height:100vh 会被外层 content-area 的 padding 挤出一圈页面底色 */
 .play-full .video-wrap {
   position: fixed;
-  inset: 0;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;  /* P9.51: inset 在 Android 9 Chromium 69 无效 */
   width: 100vw;
   height: 100vh;
   max-height: none;
@@ -1969,8 +1994,20 @@ onUnmounted(() => {
   background: #000;
   border-radius: 12px;
   overflow: hidden;
-  aspect-ratio: 16 / 9;
   max-height: 72vh;
+  /* P9.51：Android 9（Chromium 69）不支持 aspect-ratio → 视频区高度塌陷成 0/异常，
+     先以 padding-top: 56.25% 撑出 16:9（内部元素均为 absolute 四边定位，铺满 padding box
+     即为正确区域）；支持 aspect-ratio 的环境再切回原生属性并清掉 padding */
+  height: 0;
+  padding-top: 56.25%;
+}
+
+@supports (aspect-ratio: 16 / 9) {
+  .video-wrap {
+    height: auto;
+    padding-top: 0;
+    aspect-ratio: 16 / 9;
+  }
 }
 
 .video-el {
@@ -2036,7 +2073,10 @@ body.native-play .side-column {
 
 .part-loading {
   position: absolute;
-  inset: 0;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;  /* P9.51: inset 在 Android 9 Chromium 69 无效 */
   display: flex;
   align-items: center;
   justify-content: center;
@@ -2081,7 +2121,10 @@ body.native-play .side-column {
 
 .osd {
   position: absolute;
-  inset: 0;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;  /* P9.51: inset 在 Android 9 Chromium 69 无效 */
   z-index: 20;
   display: flex;
   flex-direction: column;

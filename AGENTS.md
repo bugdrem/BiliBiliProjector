@@ -21,6 +21,13 @@
 - 不用 `backdrop-filter` / 全屏阴影等重绘特效；暂停或后台停止重绘。
 - 功能与性能冲突时默认保性能，并用文案/交互补偿。
 
+## 导航 / 返回栈（P9.53）
+- 返回键语义 = **退出当前层回上级菜单**。播放页内的横向跳转（自动连播、选集/合集、相关推荐、UP 投稿）
+  一律 `navigate(path, { replace: true })`；列表页进播放页用 push。连播 N 个视频后按一次返回即回菜单。
+- **路由切回不得重发首屏请求**：列表状态放模块级 store（首页 `stores/homeFeed.js`、热门页模块标记），
+  只有显式再按一次导航项（`router.requestRefresh`）才主动刷新。
+- 取证：`logcat` 里 `[BiliTV] route a -> b` / `home mount visited=` / `rcmd fetch #N` 三条追踪。
+
 ## 通用性
 不写死分辨率/ABI；三档解码策略（hw/sw/webview）共存可降级；列表布局用比例值而非绝对像素。
 

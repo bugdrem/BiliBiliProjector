@@ -14,7 +14,13 @@ const props = defineProps({
   /** 卡片数据（api/bilibili.js 的 toCard 整形结果） */
   item: { type: Object, required: true },
   /** 焦点记忆键（默认 bvid） */
-  focusKey: { type: String, default: '' }
+  focusKey: { type: String, default: '' },
+  /**
+   * P9.53：播放页内的卡片（相关推荐 / 「接下来播放」）用 replace 跳转——
+   * 播放页里换视频不该在返回栈里堆一条记录，否则连播 3 个后要按 3 次返回
+   * 才回到菜单，中途每一次都卡在同一个播放页上。列表页（首页/热门/搜索）保持 push。
+   */
+  replace: { type: Boolean, default: false }
 })
 
 /** 时长展示：秒数格式化；search 接口的 "mm:ss" 字符串直接透出 */
@@ -39,7 +45,7 @@ const hasStats = computed(() => {
 })
 
 function open() {
-  navigate(playPath(props.item.bvid))
+  navigate(playPath(props.item.bvid), { replace: props.replace })
 }
 </script>
 
