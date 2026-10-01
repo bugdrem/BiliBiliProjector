@@ -7,8 +7,8 @@ android {
         applicationId "com.bilitv.app"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 48
-        versionName "1.3.29"
+        versionCode 49
+        versionName "1.3.30"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
@@ -40,8 +40,13 @@ dependencies {
     // 原生播放内核（P9.19 D39）：ExoPlayer 绕开 WebView 媒体栈——老投影仪（极米 Z7X）
     // 的 WebView MediaSource/解码路径存在原生崩溃，ijkplayer 预编译已随 jcenter 停服，
     // media3 为 Maven Central 稳定可得的最优替代（Apache-2.0）
-    implementation "androidx.media3:media3-exoplayer:1.4.1"
-    implementation "androidx.media3:media3-datasource:1.4.1"
+    // P9.55：1.4.1 → 1.11.1（2026-09 稳定版），吸收两年多的 MediaCodec 容错/渲染修复
+    implementation "androidx.media3:media3-exoplayer:1.9.4"
+    implementation "androidx.media3:media3-datasource:1.9.4"
+    // P9.55：ijkplayer 第 4 解码档——debugly/ijkplayer 维护版预编译 AAR（LGPL，Apache 编译脚本），
+    // FFmpeg 软解完全绕开 MediaCodec 管线，对厂商解码器 bug（Z7X 闪退）免疫度最高；
+    // minSdk 21，ABI armv7a/arm64/x86/x86_64，k0.8.9-beta-260526101841（2026-05-26）
+    implementation files('libs/ijkplayer-cmake-release.aar')
     // P9.40 D54：AV1 软解扩展方案已评估——media3-decoder-av1 未发布到 Maven 仓库，
     // 不可行已回退；EXTENSION_RENDERER_MODE_ON 保留（未来有扩展制品时自动生效）
     implementation project(':capacitor-android')

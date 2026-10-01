@@ -5,6 +5,8 @@
 *.aar
 *.ap_
 *.aab
+# P9.55：ijkplayer 预编译 AAR 是构建依赖（debugly fork 无 Maven 发布源），必须入库
+!app/libs/*.aar
 
 # Files for the ART/Dalvik VM
 *.dex

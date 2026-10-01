@@ -21,6 +21,9 @@ import androidx.media3.exoplayer.mediacodec.MediaCodecSelector;
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory;
 import androidx.media3.exoplayer.DefaultRenderersFactory;
 
+import tv.danmaku.ijk.media.player.IMediaPlayer;
+import tv.danmaku.ijk.media.player.IjkMediaPlayer;
+
 import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
@@ -70,7 +73,13 @@ public class NativePlayerPlugin extends Plugin {
     /** P9.44：Surface 单例复用+显式释放（原先每次 load 匿名 new Surface 从不 release，
      *  长时间连播/切清晰度会不断泄漏 BufferQueue，最终硬解 IllegalStateException） */
     private android.view.Surface videoSurface;
-    private String decoderMode = "hw"; // hw=硬件解码（默认） / sw=软解码
+    private String decoderMode = "hw"; // hw=硬件解码（默认） / sw=软解码 / ijk=ijkplayer 档
+    /** P9.55：ijkplayer 第 4 解码档——FFmpeg(+可选 mediacodec) 内核，绕开 ExoPlayer/MediaCodec 管线，
+     *  对厂商解码器 bug（Z7X 闪退）免疫度最高。durl 单流直连与现有原生档完全一致。 */
+    private IjkMediaPlayer ijkPlayer;
+    private boolean ijkMode = false;
+    private boolean ijkUsedMc = false; // ijk 档是否启用了 mediacodec（getStats 软硬解判定用）
+    private static boolean ijkLibsLoaded = false;
     private boolean surfaceReady = false;
     private boolean pendingStart = false;
     /** P9.44：最后一次有效播放进度（ms）——异常/IDLE 时避免把 0 写进用户历史 */
@@ -198,6 +207,125 @@ public class NativePlayerPlugin extends Plugin {
             .build();
     }
 
+    /**
+     * P9.55：ijk 档播放器搭建（必须在 UI 线程调用，事件回调依赖创建线程的 Looper）。
+     *  - durl 单流直连，headers（Referer/UA 风控头）经 ffmpeg http 协议栈注入
+     *  - mediacodec 开启（ijk 自封装，与 ExoPlayer 管线不同；失败走 JS 降级链）
+     *  - Surface 取用与 pendingStart 接棒逻辑与 media3 分支逐行对齐
+     */
+    private void setupIjk(String url, final java.util.Map<String, String> headerMap, final long startMs) {
+        try {
+            if (!ijkLibsLoaded) {
+                // debugly fork 已移除 nativeProfileBegin/End 探针接口，仅加载 so
+                IjkMediaPlayer.loadLibrariesOnce(null);
+                ijkLibsLoaded = true;
+            }
+            IjkMediaPlayer mp = new IjkMediaPlayer();
+            ijkPlayer = mp;
+
+            // 必须先设数据源再 prepareAsync（否则 ijkmp_prepare_async()=-3 EINVAL，
+            // 表现为 SurfaceView "Exception configuring surface"，静默无画面——2026-10-02 冒烟实测）
+            mp.setDataSource(url);
+
+            if (headerMap != null && !headerMap.isEmpty()) {
+                StringBuilder hb = new StringBuilder();
+                for (Map.Entry<String, String> e : headerMap.entrySet()) {
+                    hb.append(e.getKey()).append(": ").append(e.getValue()).append("\r\n");
+                }
+                mp.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "headers", hb.toString());
+            }
+            mp.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "reconnect", 1);
+            mp.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "timeout", 15000000L); // 15s（ffmpeg 微秒）
+            mp.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "start-on-prepared", 0);
+            mp.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "framedrop", 1);
+            mp.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "soundtouch", 1); // 变速不变调
+            // 模拟器（AVD/MuMu）GPU 转译下 mediacodec 输出绿帧 → 走 FFmpeg 纯软解；
+            // 真机开 ijk 自封装的 mediacodec（与 ExoPlayer 管线不同，容错更好）
+            boolean useMc = !detectEmulator();
+            mp.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "mediacodec", useMc ? 1 : 0);
+            mp.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "mediacodec-auto-rotate", useMc ? 1 : 0);
+            mp.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "mediacodec-handle-resolution-change", useMc ? 1 : 0);
+            lastDecoderName = useMc ? "ijk:mediacodec" : "ijk:ffmpeg";
+            ijkUsedMc = useMc;
+
+            mp.setOnPreparedListener(new IMediaPlayer.OnPreparedListener() {
+                @Override
+                public void onPrepared(IMediaPlayer p) {
+                    if (ijkPlayer == null) return;
+                    try {
+                        if (startMs > 0) ijkPlayer.seekTo(startMs);
+                        ijkPlayer.start();
+                    } catch (Exception ignored) { /* 状态竞争由错误监听兜底 */ }
+                    JSObject d = new JSObject();
+                    try { d.put("duration", ijkPlayer.getDuration()); } catch (Exception e) { d.put("duration", 0); }
+                    notifyListeners("prepared", d);
+                }
+            });
+            mp.setOnVideoSizeChangedListener(new IMediaPlayer.OnVideoSizeChangedListener() {
+                @Override
+                public void onVideoSizeChanged(IMediaPlayer p, int w, int h, int sarNum, int sarDen) {
+                    videoW = w;
+                    videoH = h;
+                    videoSar = sarDen == 0 ? 1f : sarNum / (float) sarDen;
+                    videoRot = 0;
+                    applyVideoFrame();
+                }
+            });
+            mp.setOnCompletionListener(new IMediaPlayer.OnCompletionListener() {
+                @Override
+                public void onCompletion(IMediaPlayer p) {
+                    notifyListeners("ended", new JSObject());
+                }
+            });
+            mp.setOnErrorListener(new IMediaPlayer.OnErrorListener() {
+                @Override
+                public boolean onError(IMediaPlayer p, int what, int extra) {
+                    JSObject d = new JSObject();
+                    d.put("message", "ijk 播放错误 what=" + what + " extra=" + extra);
+                    d.put("type", "ijk");
+                    notifyListeners("error", d);
+                    return true;
+                }
+            });
+            mp.setOnInfoListener(new IMediaPlayer.OnInfoListener() {
+                @Override
+                public boolean onInfo(IMediaPlayer p, int what, int extra) {
+                    if (what == IMediaPlayer.MEDIA_INFO_VIDEO_RENDERING_START) {
+                        android.util.Log.i("BiliTV", "ijk 档首帧渲染（起播确认）");
+                    }
+                    return false;
+                }
+            });
+
+            // Surface 取用：与 media3 分支逐行对齐（texture 自建 / surface holder 托管）
+            if (videoSurface == null) {
+                if ("texture".equals(renderType)) {
+                    if (textureView != null && textureView.isAvailable()) {
+                        textureSurface = new Surface(textureView.getSurfaceTexture());
+                        videoSurface = textureSurface;
+                        surfaceOwned = true;
+                    }
+                } else if (surfaceView != null && surfaceView.getHolder().getSurface() != null
+                    && surfaceView.getHolder().getSurface().isValid()) {
+                    videoSurface = surfaceView.getHolder().getSurface();
+                    surfaceOwned = false;
+                }
+            }
+            if (videoSurface != null) {
+                mp.setSurface(videoSurface);
+                mp.prepareAsync();
+            } else {
+                pendingStart = true; // Surface 尚未就绪：surfaceCallback 接棒
+            }
+        } catch (Exception e) {
+            android.util.Log.e("BiliTV", "ijk load 失败", e);
+            JSObject d = new JSObject();
+            d.put("message", "ijk load 失败: " + e.getMessage());
+            d.put("type", "ijk");
+            notifyListeners("error", d);
+        }
+    }
+
     /** SurfaceHolder 回调：surface 就绪即交给播放器（P9.46 SurfaceView 版） */
     /** SurfaceView 就绪后把 Surface 交给播放器（Surface 由系统持有，摘挂即可，勿 release） */
     private final SurfaceHolder.Callback surfaceCallback = new SurfaceHolder.Callback() {
@@ -206,7 +334,13 @@ public class NativePlayerPlugin extends Plugin {
             surfaceReady = true;
             videoSurface = holder.getSurface();
             surfaceOwned = false; // holder 托管，绝不能 release
-            if (player != null) {
+            if (ijkMode && ijkPlayer != null) {
+                ijkPlayer.setSurface(videoSurface);
+                if (pendingStart) {
+                    pendingStart = false;
+                    ijkPlayer.prepareAsync();
+                }
+            } else if (player != null) {
                 player.setVideoSurface(videoSurface);
                 if (pendingStart) {
                     pendingStart = false;
@@ -236,7 +370,13 @@ public class NativePlayerPlugin extends Plugin {
                 videoSurface = textureSurface;
                 surfaceOwned = true;
                 surfaceReady = true;
-                if (player != null) {
+                if (ijkMode && ijkPlayer != null) {
+                    ijkPlayer.setSurface(videoSurface);
+                    if (pendingStart) {
+                        pendingStart = false;
+                        ijkPlayer.prepareAsync();
+                    }
+                } else if (player != null) {
                     player.setVideoSurface(videoSurface);
                     if (pendingStart) {
                         pendingStart = false;
@@ -307,7 +447,9 @@ public class NativePlayerPlugin extends Plugin {
         }
         // P9.50：渲染层类型（surface|texture），Z7X 上黑屏时切 texture 对照
         renderType = "texture".equals(call.getString("render")) ? "texture" : "surface";
-        decoderMode = "sw".equals(call.getString("decoder")) ? "sw" : "hw";
+        String decRaw = call.getString("decoder");
+        decoderMode = "sw".equals(decRaw) ? "sw" : "ijk".equals(decRaw) ? "ijk" : "hw";
+        ijkMode = "ijk".equals(decoderMode);
         final double startMs = call.getDouble("startMs", 0.0);
 
         // 请求头（bilibili CDN 需要 Referer/UA；原生通道无浏览器 forbidden headers 限制）
@@ -316,8 +458,9 @@ public class NativePlayerPlugin extends Plugin {
             .setConnectTimeoutMs(10000)
             .setReadTimeoutMs(15000);
         JSObject headers = call.getObject("headers");
+        // P9.55：提前到 if 外声明——ijk 档 setupIjk 需要读取（lambda 捕获要求作用域可见）
+        final java.util.Map<String, String> headerMap = new java.util.HashMap<>();
         if (headers != null) {
-            java.util.Map<String, String> headerMap = new java.util.HashMap<>();
             java.util.Iterator<String> keys = headers.keys();
             while (keys.hasNext()) {
                 String k = keys.next();
@@ -404,6 +547,15 @@ public class NativePlayerPlugin extends Plugin {
                 rendering = true; // P9.29 D45：MainActivity 触摸拦截生效
                 // P9.50：渲染层若沉在 window 之下，window 的不透明背景会堵住挖洞 → 黑屏
                 if (!"texture".equals(renderType)) makeWindowTransparent();
+
+                // P9.55：ijk 档——渲染层/几何/触摸转发完全复用，只换播放内核。
+                // durl 单流直连，与 hw/sw 档同一条 URL。
+                if (ijkMode) {
+                    setupIjk(url, headerMap, (long) startMs);
+                    ioRetryCount = 0;
+                    call.resolve();
+                    return;
+                }
 
                 player = buildPlayer(httpFactory);
 
@@ -641,7 +793,11 @@ public class NativePlayerPlugin extends Plugin {
      * 不释放会让 MediaCodec 继续向已废弃的 BufferQueue 写帧 → 硬解崩溃/内存累积。
      */
     private void releaseSurface() {
-        if (player != null) {
+        if (ijkMode && ijkPlayer != null) {
+            try {
+                ijkPlayer.setSurface(null);
+            } catch (Exception ignored) { /* 播放器已释放 */ }
+        } else if (player != null) {
             try {
                 player.setVideoSurface(null);
             } catch (Exception ignored) { /* 播放器已释放 */ }
@@ -688,7 +844,9 @@ public class NativePlayerPlugin extends Plugin {
     @PluginMethod
     public void play(PluginCall call) {
         getActivity().runOnUiThread(() -> {
-            if (player != null) player.play();
+            if (ijkMode && ijkPlayer != null) {
+                try { ijkPlayer.start(); } catch (Exception ignored) { }
+            } else if (player != null) player.play();
             call.resolve();
         });
     }
@@ -696,7 +854,9 @@ public class NativePlayerPlugin extends Plugin {
     @PluginMethod
     public void pause(PluginCall call) {
         getActivity().runOnUiThread(() -> {
-            if (player != null) player.pause();
+            if (ijkMode && ijkPlayer != null) {
+                try { ijkPlayer.pause(); } catch (Exception ignored) { }
+            } else if (player != null) player.pause();
             call.resolve();
         });
     }
@@ -705,7 +865,9 @@ public class NativePlayerPlugin extends Plugin {
     public void seekTo(PluginCall call) {
         double ms = call.getDouble("ms", 0.0);
         getActivity().runOnUiThread(() -> {
-            if (player != null) player.seekTo((long) ms);
+            if (ijkMode && ijkPlayer != null) {
+                try { ijkPlayer.seekTo((long) ms); } catch (Exception ignored) { }
+            } else if (player != null) player.seekTo((long) ms);
             call.resolve();
         });
     }
@@ -714,7 +876,9 @@ public class NativePlayerPlugin extends Plugin {
     public void setSpeed(PluginCall call) {
         double speed = call.getDouble("speed", 1.0);
         getActivity().runOnUiThread(() -> {
-            if (player != null) player.setPlaybackParameters(new androidx.media3.common.PlaybackParameters((float) speed));
+            if (ijkMode && ijkPlayer != null) {
+                try { ijkPlayer.setSpeed((float) speed); } catch (Exception ignored) { }
+            } else if (player != null) player.setPlaybackParameters(new androidx.media3.common.PlaybackParameters((float) speed));
             call.resolve();
         });
     }
@@ -724,7 +888,19 @@ public class NativePlayerPlugin extends Plugin {
     public void getProgress(PluginCall call) {
         getActivity().runOnUiThread(() -> {
             JSObject d = new JSObject();
-            if (player != null) {
+            if (ijkMode && ijkPlayer != null) {
+                long pos = 0, dur = 0;
+                boolean playing = false;
+                try {
+                    pos = ijkPlayer.getCurrentPosition();
+                    dur = ijkPlayer.getDuration();
+                    playing = ijkPlayer.isPlaying();
+                } catch (Exception ignored) { /* 释放竞争时给兜底值 */ }
+                if (pos > 0) lastKnownPos = pos;
+                d.put("position", pos > 0 ? pos : lastKnownPos);
+                d.put("duration", dur);
+                d.put("playing", playing);
+            } else if (player != null) {
                 long pos = player.getCurrentPosition();
                 // P9.44：出错/IDLE 时 getCurrentPosition() 会返回 0，JS 侧会把 0 写进观看历史
                 // （表现为"从来没看过进度"）。这里保留最后一次有效进度兜底。
@@ -750,9 +926,10 @@ public class NativePlayerPlugin extends Plugin {
         getActivity().runOnUiThread(() -> {
             JSObject d = new JSObject();
             d.put("decoder", lastDecoderName == null ? "" : lastDecoderName);
-            // 解码器名带 .google./c2.android./sw 等特征 → 软件解码
+            // 解码器名带 .google./c2.android./sw 等特征 → 软件解码；ijk 档按实际开关判定
             String dn = (lastDecoderName == null ? "" : lastDecoderName).toLowerCase();
-            d.put("software", dn.contains(".google.") || dn.contains("c2.android.") || dn.contains("sw") || dn.contains("omx.google"));
+            d.put("software", ijkMode ? !ijkUsedMc
+                : dn.contains(".google.") || dn.contains("c2.android.") || dn.contains("sw") || dn.contains("omx.google"));
             d.put("dropped", droppedFrames);
             d.put("rendered", renderedFrames);
             d.put("videoW", videoW);
@@ -849,6 +1026,14 @@ public class NativePlayerPlugin extends Plugin {
         videoRot = 0;
         // 顺序：先摘/释放 Surface，再 stop/release，避免 MediaCodec 继续写废弃队列
         releaseSurface();
+        if (ijkPlayer != null) {
+            try {
+                ijkPlayer.stop();
+                ijkPlayer.release();
+            } catch (Exception ignored) {
+            }
+            ijkPlayer = null;
+        }
         if (player != null) {
             try {
                 player.stop();
@@ -866,6 +1051,14 @@ public class NativePlayerPlugin extends Plugin {
     /** P9.44：退后台/息屏时停止解码并释放 Surface（ExoPlayer 默认会在后台继续解码） */
     @Override
     protected void handleOnPause() {
+        if (ijkMode && ijkPlayer != null) {
+            try {
+                lastKnownPos = ijkPlayer.getCurrentPosition();
+                ijkPlayer.pause();
+                releaseSurface();
+            } catch (Exception ignored) { /* 播放器已释放 */ }
+            return;
+        }
         if (player != null) {
             try {
                 lastKnownPos = player.getCurrentPosition();
@@ -879,6 +1072,25 @@ public class NativePlayerPlugin extends Plugin {
     @Override
     protected void handleOnResume() {
         rendering = false; // 桥重建场景：抹掉可能残留的静态标记
+        if (ijkMode) {
+            if (ijkPlayer == null || activeRender() == null) return;
+            try {
+                if (!"texture".equals(renderType)) {
+                    Surface s = surfaceView.getHolder().getSurface();
+                    if (s != null && s.isValid() && videoSurface == null) {
+                        videoSurface = s;
+                        surfaceOwned = false;
+                    }
+                }
+                if (videoSurface != null) {
+                    surfaceReady = true;
+                    ijkPlayer.setSurface(videoSurface);
+                    if (lastKnownPos > 0) ijkPlayer.seekTo(lastKnownPos);
+                    ijkPlayer.start();
+                }
+            } catch (Exception ignored) { /* 下次 load 会重建 */ }
+            return;
+        }
         if (player == null || activeRender() == null) return;
         try {
             if (!"texture".equals(renderType)) {

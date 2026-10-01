@@ -24,7 +24,7 @@ Z7X 是**最紧的约束**，任何改动先问「Z7X 上会不会退化」：
 |---|---|---|
 | WebView 媒体栈崩溃 | 极米 Z7X 的 WebView 跑 MSE/DURL 都触发原生崩溃 | 播放**必须走原生内核** `NativePlayerPlugin`（ExoPlayer + TextureView），`<video>`/MSE 只作降级回退 |
 | WebView 版本偏旧 | 老 Chromium 对部分新 CSS/JS 支持不齐 | 用新语法时必须给 fallback：`aspect-ratio` 配 `@supports not` 兜底；不用 `:has()` 承载关键布局；esbuild target `es2018` |
-| 解码器输出异常 | 部分软/硬解码组合出纯绿帧 | 解码器 hw/sw 可切换 + 模拟器自动判软解（`isEmulator`）；失败降级链：原生 hw → 原生 sw → WebView |
+| 解码器输出异常 | 部分软/硬解码组合出纯绿帧 | 解码器 hw/sw 可切换 + 模拟器自动判软解（`isEmulator`）；失败降级链：原生 hw → 原生 sw → 原生 ijk → WebView |
 | 内存/GPU 弱 | 大图、全屏重绘、模糊特效都会卡 | 封面强制走图床缩略后缀（`@480w_270h_1c.webp`）；避免大面积 `backdrop-filter` / 全屏阴影动画 |
 | 输入方式 | 遥控器（DPAD + OK + 返回 + 媒体键），无触摸 | 所有可点元素必须可被 `focus.js` 的空间导航命中；新增 UI 要带 `data-focus-zone` |
 | 显示距离 | 3 米观看 | 字号 ≥ 20px、热区 ≥ 60px、焦点态要有明确描边+缩放反馈 |
@@ -33,7 +33,9 @@ Z7X 是**最紧的约束**，任何改动先问「Z7X 上会不会退化」：
 
 - 不可写死分辨率/比例/ABI：布局用 flex + 比例值，不能用 `1920px` 之类的常量。
 - 检测分支要**可回退**：设备特征检测（`isEmulator`、`deviceProbe`）失败时不能锁死在最差档。
-- 解码/渲染策略三档共存（hw / sw / webview），任一档被证明可用就不能删除另一档。
+- 解码/渲染策略四档共存（hw / sw / ijk / webview），任一档被证明可用就不能删除另一档。
+  ijk 档（P9.55）= debugly/ijkplayer AAR（`android/app/libs/`，升级只能换文件），IjkMediaPlayer 的
+  `setDataSource` 必须在 `prepareAsync` 之前（否则 EINVAL 静默无画面）；模拟器 ijk 走 FFmpeg 纯软解。
 - `AndroidManifest` 保持 `leanback required=false` + `touchscreen required=false`：手机/平板/电视都能装。
 - minSdk 23 及以上，UI 不能依赖单一厂商 ROM 特性。
 

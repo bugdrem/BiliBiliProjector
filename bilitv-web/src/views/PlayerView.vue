@@ -382,7 +382,8 @@ async function pickNativeQuality(qn) {
   focusEngine.popLayer()
   if (qn === qualityId.value) return
   const at = curTime.value || 0
-  const dec = effectiveDecoder() === 'sw' ? 'sw' : 'hw'
+  const eff = effectiveDecoder()
+  const dec = eff === 'sw' || eff === 'ijk' ? eff : 'hw'
   partLoading.value = true
   try {
     const play = await getPlayUrl(props.bvid, curCid.value, qn)
@@ -563,7 +564,7 @@ function effectiveDecoder() {
 /** 当前是否走原生内核 */
 function nativeWanted() {
   const dec = effectiveDecoder()
-  return (dec === 'hw' || dec === 'sw') && nativePlayerAvailable()
+  return (dec === 'hw' || dec === 'sw' || dec === 'ijk') && nativePlayerAvailable()
 }
 
 /** 渲染层几何同步：量取占位盒（CSS px）→ 插件乘 dpr 定位 TextureView */
@@ -744,8 +745,8 @@ async function attachNativeListeners() {
 }
 
 /**
- * 原生内核错误自动降级（P9.38 D53）：绿屏/花屏/解码失败的自动止损链——
- * 硬解失败 → 软解重试；软解失败 → WebView 内核重试；每视频限一轮，防循环。
+ * 原生内核错误自动降级（P9.38 D53 / P9.55 扩展）：绿屏/花屏/解码失败的自动止损链——
+ * 硬解失败 → 软解重试 → ijkplayer 兜底 → WebView 内核重试；每视频限一轮，防循环。
  * （Z7X 上 WebView 崩溃由既有崩溃自愈接管）
  */
 let nativeFallbackUsed = false
@@ -762,12 +763,16 @@ function handleNativeError(d) {
   // 「原生失败 → 降级 WebView → 闪退 → 下次强制原生 → 再失败」死循环。
   // 高危会话下原生失败就停住并提示，让用户手动切解码器。
   const webviewAllowed = !runtimeSession.crashDetected && !runtimeSession.emulator
+  // P9.55：降级链加入 ijk 档（hw → sw → ijk → WebView；ijk=FFmpeg/ijkplayer 内核，
+  // 完全绕开 ExoPlayer/MediaCodec 管线，对厂商解码器 bug 免疫度最高）
   const chain =
     dec === 'hw'
-      ? ['sw', ...(webviewAllowed ? ['webview'] : [])]
+      ? ['sw', 'ijk', ...(webviewAllowed ? ['webview'] : [])]
       : dec === 'sw'
-        ? webviewAllowed ? ['webview'] : []
-        : []
+        ? ['ijk', ...(webviewAllowed ? ['webview'] : [])]
+        : dec === 'ijk'
+          ? webviewAllowed ? ['webview'] : []
+          : []
   const next = chain[0]
   if (!next) {
     toastError(new Error('原生播放错误：' + (d.message || 'unknown') + '（可到设置页切换解码器重试）'))
@@ -776,7 +781,13 @@ function handleNativeError(d) {
   }
   nativeFallbackUsed = true
   runtimeSession.decoder = next
-  toast(next === 'sw' ? '解码异常，已自动切换软解码重试' : '软解异常，已切换 WebView 内核重试')
+  const nextToast =
+    next === 'sw'
+      ? '解码异常，已自动切换软解码重试'
+      : next === 'ijk'
+        ? '软解异常，已切换 ijkplayer 兜底解码重试'
+        : '已切换 WebView 内核重试'
+  toast(nextToast)
   const page = video.value && video.value.pages ? video.value.pages[partIdx.value] : null
   openPart(page, curTime.value || 0)
 }

@@ -118,7 +118,8 @@ const codecName = computed(() => {
 const DECODER_STEPS = [
   { v: 'webview', name: 'WebView 内核' },
   { v: 'hw', name: '原生·硬解码' },
-  { v: 'sw', name: '原生·软解码' }
+  { v: 'sw', name: '原生·软解码' },
+  { v: 'ijk', name: '原生·ijk 兜底' }
 ]
 const decoderName = computed(() => {
   const s = DECODER_STEPS.find((x) => x.v === settings.decoder)

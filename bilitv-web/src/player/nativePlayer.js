@@ -38,7 +38,8 @@ export function biliHeaders() {
 
 /**
  * 加载直连流并起播
- * @param {{url:string, decoder:'hw'|'sw', startSec?:number, rect?:{x:number,y:number,w:number,h:number}, dpr?:number}} opts
+ * @param {{url:string, decoder:'hw'|'sw'|'ijk', startSec?:number, rect?:{x:number,y:number,w:number,h:number}, dpr?:number}} opts
+ *  decoder=ijk：ijkplayer 档（P9.55，FFmpeg+mediacodec，绕开 ExoPlayer/MediaCodec 管线）
  */
 export async function nativeLoad(opts) {
   if (opts.rect) {

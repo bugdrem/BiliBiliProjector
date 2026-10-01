@@ -29,7 +29,7 @@
 - 取证：`logcat` 里 `[BiliTV] route a -> b` / `home mount visited=` / `rcmd fetch #N` 三条追踪。
 
 ## 通用性
-不写死分辨率/ABI；三档解码策略（hw/sw/webview）共存可降级；列表布局用比例值而非绝对像素。
+不写死分辨率/ABI；四档解码策略（hw/sw/ijk/webview）共存可降级（P9.55 起 ijk=ijkplayer 档，AAR 在 android/app/libs/）；列表布局用比例值而非绝对像素。
 
 ## 交付纪律
 `npm run build` → `cap sync android` → `gradlew assembleRelease`（JAVA_HOME=`.tools/jdk-21`）→ `releases/BiliTV-vX.Y.Z-release.apk`。

@@ -65,11 +65,12 @@ export const settings = reactive({
   defaultQn: loadLS('bilitv.set.defaultqn', 'max'),
   /** 播放编码（P9.14 D36）：default=跟随默认(avc1优先)/avc1/hev1/av01；播放页可仅当前视频覆盖 */
   defaultCodec: loadLS('bilitv.set.defaultcodec', 'default'),
-  /** 解码器（P9.19 D39）：webview=WebView 内核（默认）/hw=原生硬解码/sw=原生软解码。
-   *  旧值 auto/ijk 归一化为 webview；原生内核 = ExoPlayer 绕开 WebView 媒体栈（老投影崩溃根治） */
+  /** 解码器（P9.19 D39）：webview=WebView 内核（默认）/hw=原生硬解码/sw=原生软解码
+   *  /ijk=ijkplayer 档（P9.55，FFmpeg+mediacodec，绕开 ExoPlayer 管线，厂商解码 bug 兜底）。
+   *  旧值 auto 归一化为 webview；原生内核 = 绕开 WebView 媒体栈（老投影崩溃根治） */
   decoder: (() => {
     const v = loadLS('bilitv.set.decoder', 'webview')
-    return v === 'hw' || v === 'sw' ? v : 'webview'
+    return v === 'hw' || v === 'sw' || v === 'ijk' ? v : 'webview'
   })(),
   /** 省资源模式（P9.48）：null=跟随设备画像自动 / true=强制开 / false=强制关。
    *  开启后弹幕降分辨率+降帧+降密度、进度轮询降频——2GB/4 核这类弱设备防卡死的兜底档 */
