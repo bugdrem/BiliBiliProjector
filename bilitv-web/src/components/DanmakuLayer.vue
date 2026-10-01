@@ -13,8 +13,25 @@
  *   挂载 + resize 时计算，滚动帧内每 64 帧低频校验
  * - 暂停/页面隐藏时跳过重绘（保留当前帧，省算力与功耗）
  */
-import { ref, watch, onMounted, onUnmounted } from 'vue'
+import { ref, watch, onMounted, onUnmounted, computed } from 'vue'
 import { getDanmakuXml } from '../api/bilibili'
+import { isLowPerf } from '../stores/app'
+
+/**
+ * 省资源档（P9.48，针对 2GB/4 核这类弱设备，播放页卡死的主因是全屏 canvas 的
+ * 软渲染填充 + 每帧描边/填充双绘）。降档项：
+ *  - 画布渲染分辨率降到 55%（像素填充量约为原来的 1/3，CSS 拉伸回全屏）
+ *  - 同屏滚动弹幕 30 → 12
+ *  - 去掉描边（strokeText 与 fillText 各画一遍，直接省一半绘制）
+ *  - 30fps（每 2 帧渲染一次）
+ *  - 弹幕池截断到 2500 条（热门视频上万条时数组遍历与调度也吃 CPU）
+ */
+const lowPerf = computed(() => isLowPerf())
+const CANVAS_SCALE = computed(() => (lowPerf.value ? 0.55 : 1))
+const MAX_ACTIVE = computed(() => (lowPerf.value ? 12 : 30))
+const POOL_CAP = computed(() => (lowPerf.value ? 2500 : Infinity))
+/** 帧计数（省资源档跳帧用） */
+let frameCount = 0
 
 const props = defineProps({
   /** WebView 模式的 <video> 元素（原生内核模式下为 null） */
@@ -120,6 +137,8 @@ async function load(cid) {
   try {
     const xml = await getDanmakuXml(cid)
     comments = parseXml(xml)
+    // P9.48：省资源档截断弹幕池（热门视频上万条时数组与调度都吃资源）
+    if (comments.length > POOL_CAP.value) comments.length = POOL_CAP.value
     ;(window.__dmDebug = window.__dmDebug || []).push(
       `layer cid=${cid} xml=${xml.length} comments=${comments.length}`
     )
@@ -134,9 +153,12 @@ function fitCanvas() {
   const cvs = canvasRef.value
   if (!cvs || !cvs.parentElement) return
   const r = cvs.parentElement.getBoundingClientRect()
-  if (r.width > 0 && (cvs.width !== Math.floor(r.width) || cvs.height !== Math.floor(r.height))) {
-    cvs.width = Math.floor(r.width)
-    cvs.height = Math.floor(r.height)
+  // P9.48：省资源档下按 0.55 倍渲染再拉伸（canvas 内存位图与每帧填充同步下降）
+  const bw = Math.floor(r.width * CANVAS_SCALE.value)
+  const bh = Math.floor(r.height * CANVAS_SCALE.value)
+  if (r.width > 0 && (cvs.width !== bw || cvs.height !== bh)) {
+    cvs.width = bw
+    cvs.height = bh
   }
 }
 
@@ -145,7 +167,7 @@ function takeLane(text, w, now) {
   const h = canvasRef.value ? canvasRef.value.height : 360
   // 显示区域：泳道只分布在画布上部 area 比例内（驻留型弹幕不受限）
   const usableH = h * Math.min(1, Math.max(0.1, props.area))
-  const laneCount = Math.max(1, Math.floor(usableH / LANE_H) - 1)
+  const laneCount = Math.max(1, Math.floor(usableH / (LANE_H * CANVAS_SCALE.value)) - 1)
   // 动态补齐（area 档位变大时泳道数增加）；缩小时多余泳道自然不被选中
   while (lanes.length < laneCount) lanes.push({ lastText: '', lastW: 0, lastT: -99 })
   for (let i = 0; i < laneCount; i++) {
@@ -200,9 +222,6 @@ function startLoop() {
   rafId = requestAnimationFrame(frame)
 }
 
-/** 同屏滚动弹幕上限（docs/01 §6.3：≤30 条，防止密集合集把老设备压垮） */
-const MAX_ACTIVE = 30
-
 /** 每帧渲染 */
 function frame(ts) {
   const cvs = canvasRef.value
@@ -218,6 +237,9 @@ function frame(ts) {
   }
   rafId = requestAnimationFrame(frame)
 
+  // P9.48：省资源档 30fps（隔帧绘制）——弱设备上弹幕是最大的 CPU 占用之一
+  if (lowPerf.value && (frameCount++ & 1)) return
+
   // 尺寸校验：每 64 帧一次（约 1 秒），替代每帧 getBoundingClientRect
   if ((rafId & 63) === 0) fitCanvas()
   if (!cvs.width) fitCanvas()
@@ -225,6 +247,10 @@ function frame(ts) {
   const now = currentTime()
   const w = cvs.width
   const h = cvs.height
+  // P9.48：省资源档画布是降分辨率渲染再拉伸，字号/泳道/边距都要同步缩放，
+  // 否则画布变小后文字反而被放大、泳道数变少（视觉错乱）
+  const scale = CANVAS_SCALE.value
+  const laneH = LANE_H * scale
   ctx.clearRect(0, 0, w, h)
   ctx.globalAlpha = props.opacity
   ctx.textBaseline = 'middle'
@@ -245,7 +271,7 @@ function frame(ts) {
       // P9.44：同屏上限保护——密度=全量时某些热门视频会同时挂数百条，
       // 每帧 measureText + 描边/填充双绘，Z7X 直接掉帧
       if (activeScroll.length >= MAX_ACTIVE) continue
-      const fontSize = 22 * c.size * props.fontSizeScale
+      const fontSize = 22 * c.size * props.fontSizeScale * scale
       ctx.font = `bold ${fontSize}px sans-serif`
       const tw = ctx.measureText(c.text).width
       const lane = takeLane(c.text, tw, now)
@@ -272,8 +298,8 @@ function frame(ts) {
       activeScroll.splice(i, 1)
       continue
     }
-    const y = c._lane * LANE_H + LANE_H / 2 + 8
-    ctx.strokeText(c.text, x, y)
+    const y = c._lane * laneH + laneH / 2 + 8 * scale
+    if (!lowPerf.value) ctx.strokeText(c.text, x, y) // P9.48：省资源档省掉描边这一遍绘制
     ctx.fillStyle = c.color
     ctx.fillText(c.text, x, y)
   }
@@ -285,12 +311,12 @@ function frame(ts) {
       pinned.splice(i, 1)
       continue
     }
-    const fontSize = 22 * c.size * props.fontSizeScale
+    const fontSize = 22 * c.size * props.fontSizeScale * scale
     ctx.font = `bold ${fontSize}px sans-serif`
     const tw = ctx.measureText(c.text).width
     const x = (w - tw) / 2
-    const y = c.mode === 'top' ? 40 : h - 56
-    ctx.strokeText(c.text, x, y)
+    const y = c.mode === 'top' ? 40 * scale : h - 56 * scale
+    if (!lowPerf.value) ctx.strokeText(c.text, x, y) // P9.48：同上
     ctx.fillStyle = c.color
     ctx.fillText(c.text, x, y)
   }

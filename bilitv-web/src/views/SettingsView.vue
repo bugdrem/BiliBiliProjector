@@ -5,7 +5,7 @@
  * 账号行：未登录 → 跳我的页扫码；已登录 → 确认退出。
  */
 import { ref, computed, nextTick, onUnmounted } from 'vue'
-import { settings, histClear } from '../stores/app'
+import { settings, histClear, runtimeSession } from '../stores/app'
 import { CODEC_OPTIONS } from '../api/bilibili'
 import { auth, logout as authLogout } from '../stores/auth'
 import { focusEngine } from '../core/focus'
@@ -16,6 +16,23 @@ import { probeDeviceInfo, runCpuBenchmark, analyzeDevice, probeAppVersion } from
 
 /** 弹幕透明度档位 */
 const OPACITY_STEPS = [0.5, 0.7, 0.85, 1]
+
+/**
+ * 省资源模式（P9.48）：三态循环 自动 → 开 → 关 → 自动。
+ * 生效范围：弹幕降分辨率/降帧/降密度/去描边 + 进度轮询降频（下次进播放页生效）。
+ */
+const lowPerfText = computed(() => {
+  if (settings.lowPerf === true) return '强制开启'
+  if (settings.lowPerf === false) return '强制关闭'
+  return runtimeSession.lowPerf ? '自动：已开启（弱设备）' : '自动：未开启'
+})
+
+function toggleLowPerf() {
+  if (settings.lowPerf === null) settings.lowPerf = true
+  else if (settings.lowPerf === true) settings.lowPerf = false
+  else settings.lowPerf = null
+  toast(lowPerfText.value, { duration: 2400 })
+}
 
 /**
  * 底栏版本信息（P9.44）：形如 `BiliTV-v1.3.21-release`
@@ -436,6 +453,16 @@ function cancelClear() {
 
     <!-- 通用 -->
     <div class="group-title">通用</div>
+    <div
+      v-focusable
+      class="setting-row"
+      data-focus-key="set-lowperf"
+      @click="toggleLowPerf"
+    >
+      <span>省资源模式（弱设备防卡死）</span>
+      <span class="value">{{ lowPerfText }} ›</span>
+    </div>
+
     <div v-focusable class="setting-row" data-focus-key="set-autonext" @click="settings.autoNext = !settings.autoNext">
       <span>自动连播（播完播相关推荐）</span>
       <span class="switch-dot" :class="{ on: settings.autoNext }"></span>

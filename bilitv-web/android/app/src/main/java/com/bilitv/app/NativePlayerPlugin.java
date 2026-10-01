@@ -128,6 +128,20 @@ public class NativePlayerPlugin extends Plugin {
      * LoadControl 缓冲调优（P9.38 D53：起播缓冲 2.5s / 重缓冲 5s / 上限 60s，
      * 弱网与慢解码设备减少起播卡顿与播放中停顿）
      */
+    /** 设备总内存（GB），取不到返回 0 */
+    private float totalMemGB() {
+        try {
+            android.app.ActivityManager am =
+                (android.app.ActivityManager) getContext().getSystemService(android.content.Context.ACTIVITY_SERVICE);
+            if (am == null) return 0f;
+            android.app.ActivityManager.MemoryInfo mi = new android.app.ActivityManager.MemoryInfo();
+            am.getMemoryInfo(mi);
+            return mi.totalMem / 1024f / 1024f / 1024f;
+        } catch (Exception e) {
+            return 0f;
+        }
+    }
+
     private ExoPlayer buildPlayer(DefaultHttpDataSource.Factory httpFactory) {
         DefaultRenderersFactory renderersFactory = new DefaultRenderersFactory(getContext())
             .setMediaCodecSelector(buildSelector())
@@ -140,9 +154,16 @@ public class NativePlayerPlugin extends Plugin {
         // P9.44 内存与卡顿权衡：原先 min 30s/max 60s + prioritizeTimeOverSizeThresholds(true)
         // 取消了 DefaultAllocator 的字节上限，长时间连播会持续吃内存/带宽，与 WebView 弹幕层抢资源。
         // 改为 15s/30s + 5s 重缓冲，保留回看缓冲（遥控器回拖），并恢复字节上限。
+        // P9.48：低内存设备（≤2.5GB，如 Z7X 的 2GB）缓冲窗口减半——
+        // 720p 每 15s 缓冲约 20-30MB，2GB 设备上与 WebView/弹幕争内存会拖到卡死
+        boolean lowMem = totalMemGB() > 0 && totalMemGB() <= 2.5f;
         DefaultLoadControl loadControl = new DefaultLoadControl.Builder()
-            .setBufferDurationsMs(15000, 30000, 2500, 5000)
-            .setBackBuffer(30000, true)
+            .setBufferDurationsMs(
+                lowMem ? 8000 : 15000,
+                lowMem ? 16000 : 30000,
+                2500,
+                lowMem ? 3000 : 5000)
+            .setBackBuffer(lowMem ? 8000 : 30000, true)
             .build();
         return new ExoPlayer.Builder(getContext(), renderersFactory)
             .setLoadControl(loadControl)

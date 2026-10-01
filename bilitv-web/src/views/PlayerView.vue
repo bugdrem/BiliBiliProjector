@@ -17,7 +17,7 @@ import {
   nativeSeekTo, nativeSetSpeed, nativeGetProgress, nativeRelease, nativeOn
 } from '../player/nativePlayer'
 import { focusEngine } from '../core/focus'
-import { settings, histAdd, histGet, toggleFav, isFav, runtimeSession, markLive } from '../stores/app'
+import { settings, histAdd, histGet, toggleFav, isFav, runtimeSession, markLive, isLowPerf } from '../stores/app'
 import { toast, toastError } from '../utils/toast'
 import { fmtClock, fmtCount } from '../utils/format'
 import DanmakuLayer from '../components/DanmakuLayer.vue'
@@ -653,7 +653,10 @@ const pubDateText = computed(() => {
   }
 })
 
-/** 原生内核进度轮询：驱动 timeupdate 语义（500ms） */
+/**
+ * 原生内核进度轮询：驱动 timeupdate 语义（500ms；P9.48 省资源档降为 1s——
+ * 每次回调都会触发 Vue 响应式更新与进度落库，弱设备上要减少主线程抖动）
+ */
 function startNativePoll() {
   stopNativePoll()
   nativePollTimer = setInterval(async () => {
@@ -671,7 +674,7 @@ function startNativePoll() {
     } catch (_) {
       /* 轮询失败静默（插件可能已释放） */
     }
-  }, 500)
+  }, isLowPerf() ? 1000 : 500)
 }
 
 function stopNativePoll() {

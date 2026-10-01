@@ -70,7 +70,10 @@ export const settings = reactive({
   decoder: (() => {
     const v = loadLS('bilitv.set.decoder', 'webview')
     return v === 'hw' || v === 'sw' ? v : 'webview'
-  })()
+  })(),
+  /** 省资源模式（P9.48）：null=跟随设备画像自动 / true=强制开 / false=强制关。
+   *  开启后弹幕降分辨率+降帧+降密度、进度轮询降频——2GB/4 核这类弱设备防卡死的兜底档 */
+  lowPerf: loadLS('bilitv.set.lowperf', null)
 })
 
 watch(
@@ -105,7 +108,18 @@ watch(
 
 /** 会话级解码器覆写（崩溃自愈用，不持久化）：null=跟随 settings.decoder，否则 'hw'|'sw'。
  *  emulator：模拟器环境标记（P9.26 D42），启动时由 applyDeviceProfile 判定 */
-export const runtimeSession = { decoder: null, crashDetected: false, emulator: false }
+export const runtimeSession = { decoder: null, crashDetected: false, emulator: false, lowPerf: false }
+
+/**
+ * 是否走省资源档（P9.48）
+ * 用户显式选过（settings.lowPerf 非 null）以用户为准，否则按设备画像自动判定：
+ * 内存 ≤ 2.5GB 或 核数 ≤ 2 视为弱设备（极米 Z7X：2GB/4 核 → 命中）。
+ */
+export function isLowPerf() {
+  if (settings.lowPerf === true) return true
+  if (settings.lowPerf === false) return false
+  return !!runtimeSession.lowPerf
+}
 
 /**
  * 设备画像（P9.26 D42）：模拟器环境自动切换原生软解内核。
@@ -118,6 +132,16 @@ export async function applyDeviceProfile() {
   try {
     const emu = await isEmulatorDevice()
     runtimeSession.emulator = emu
+
+    // P9.48：弱设备画像 → 省资源档（2GB/4 核这类设备播放页会卡死，必须降档）
+    const info = await probeDeviceInfo()
+    const memGB = Number(info && info.memGB) || 0
+    const cores = Number(info && info.cores) || 0
+    runtimeSession.lowPerf = (memGB > 0 && memGB <= 2.5) || (cores > 0 && cores <= 2)
+    if (runtimeSession.lowPerf) {
+      console.warn(`[BiliTV] 弱设备画像（${cores}核/${memGB}GB），本次会话启用省资源模式`)
+    }
+
     if (!emu) return false
     const touched = loadLS('bilitv.set.decoderTouched', false)
     if (!touched && runtimeSession.decoder !== 'sw') {
